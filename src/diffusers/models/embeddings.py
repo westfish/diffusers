@@ -15,12 +15,12 @@ import math
 from typing import Optional
 
 import numpy as np
-import torch
-from torch import nn
+import paddle
+from paddle import nn
 
 
 def get_timestep_embedding(
-    timesteps: torch.Tensor,
+    timesteps: paddle.Tensor,
     embedding_dim: int,
     flip_sin_to_cos: bool = False,
     downscale_freq_shift: float = 1,
@@ -38,27 +38,26 @@ def get_timestep_embedding(
     assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
 
     half_dim = embedding_dim // 2
-    exponent = -math.log(max_period) * torch.arange(
-        start=0, end=half_dim, dtype=torch.float32, device=timesteps.device
-    )
+    exponent = -math.log(max_period) * paddle.arange(start=0, end=half_dim, dtype="float32")
+
     exponent = exponent / (half_dim - downscale_freq_shift)
 
-    emb = torch.exp(exponent)
-    emb = timesteps[:, None].float() * emb[None, :]
+    emb = paddle.exp(exponent)
+    emb = timesteps[:, None].cast("float32") * emb[None, :]
 
     # scale embeddings
     emb = scale * emb
 
     # concat sine and cosine embeddings
-    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+    emb = paddle.concat([paddle.sin(emb), paddle.cos(emb)], axis=-1)
 
     # flip sine and cosine embeddings
     if flip_sin_to_cos:
-        emb = torch.cat([emb[:, half_dim:], emb[:, :half_dim]], dim=-1)
+        emb = paddle.concat([emb[:, half_dim:], emb[:, :half_dim]], axis=-1)
 
     # zero pad
     if embedding_dim % 2 == 1:
-        emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
+        emb = paddle.concat(emb, paddle.zeros([emb.shape[0], 1]), axis=-1)
     return emb
 
 
@@ -112,7 +111,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     return emb
 
 
-class PatchEmbed(nn.Module):
+class PatchEmbed(nn.Layer):
     """2D Image to Patch Embedding"""
 
     def __init__(
@@ -132,27 +131,28 @@ class PatchEmbed(nn.Module):
         self.flatten = flatten
         self.layer_norm = layer_norm
 
-        self.proj = nn.Conv2d(
-            in_channels, embed_dim, kernel_size=(patch_size, patch_size), stride=patch_size, bias=bias
+        self.proj = nn.Conv2D(
+            in_channels, embed_dim, kernel_size=(patch_size, patch_size), stride=patch_size, bias_attr=bias
         )
         if layer_norm:
-            self.norm = nn.LayerNorm(embed_dim, elementwise_affine=False, eps=1e-6)
+            # elementwise_affine=False  -> weight_attr=False, bias_attr=False
+            self.norm = nn.LayerNorm(embed_dim, epsilon=1e-6, weight_attr=False, bias_attr=False)
         else:
             self.norm = None
 
         pos_embed = get_2d_sincos_pos_embed(embed_dim, int(num_patches**0.5))
-        self.register_buffer("pos_embed", torch.from_numpy(pos_embed).float().unsqueeze(0), persistent=False)
+        self.register_buffer("pos_embed", paddle.to_tensor(pos_embed).cast("float32").unsqueeze(0), persistable=False)
 
     def forward(self, latent):
         latent = self.proj(latent)
         if self.flatten:
-            latent = latent.flatten(2).transpose(1, 2)  # BCHW -> BNC
+            latent = latent.flatten(2).transpose([0, 2, 1])  # BCHW -> BNC
         if self.layer_norm:
             latent = self.norm(latent)
         return latent + self.pos_embed
 
 
-class TimestepEmbedding(nn.Module):
+class TimestepEmbedding(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -167,12 +167,12 @@ class TimestepEmbedding(nn.Module):
         self.linear_1 = nn.Linear(in_channels, time_embed_dim)
 
         if cond_proj_dim is not None:
-            self.cond_proj = nn.Linear(cond_proj_dim, in_channels, bias=False)
+            self.cond_proj = nn.Linear(cond_proj_dim, in_channels, bias_attr=False)
         else:
             self.cond_proj = None
 
         if act_fn == "silu":
-            self.act = nn.SiLU()
+            self.act = nn.Silu()
         elif act_fn == "mish":
             self.act = nn.Mish()
         elif act_fn == "gelu":
@@ -189,7 +189,7 @@ class TimestepEmbedding(nn.Module):
         if post_act_fn is None:
             self.post_act = None
         elif post_act_fn == "silu":
-            self.post_act = nn.SiLU()
+            self.post_act = nn.Silu()
         elif post_act_fn == "mish":
             self.post_act = nn.Mish()
         elif post_act_fn == "gelu":
@@ -212,7 +212,7 @@ class TimestepEmbedding(nn.Module):
         return sample
 
 
-class Timesteps(nn.Module):
+class Timesteps(nn.Layer):
     def __init__(self, num_channels: int, flip_sin_to_cos: bool, downscale_freq_shift: float):
         super().__init__()
         self.num_channels = num_channels
@@ -229,37 +229,37 @@ class Timesteps(nn.Module):
         return t_emb
 
 
-class GaussianFourierProjection(nn.Module):
+class GaussianFourierProjection(nn.Layer):
     """Gaussian Fourier embeddings for noise levels."""
 
     def __init__(
         self, embedding_size: int = 256, scale: float = 1.0, set_W_to_weight=True, log=True, flip_sin_to_cos=False
     ):
         super().__init__()
-        self.weight = nn.Parameter(torch.randn(embedding_size) * scale, requires_grad=False)
+        self.register_buffer("weight", paddle.randn((embedding_size,)) * scale)
         self.log = log
         self.flip_sin_to_cos = flip_sin_to_cos
 
         if set_W_to_weight:
             # to delete later
-            self.W = nn.Parameter(torch.randn(embedding_size) * scale, requires_grad=False)
+            self.register_buffer("W", paddle.randn((embedding_size,)) * scale)
 
             self.weight = self.W
 
     def forward(self, x):
         if self.log:
-            x = torch.log(x)
+            x = paddle.log(x.cast(self.weight.dtype))
 
         x_proj = x[:, None] * self.weight[None, :] * 2 * np.pi
 
         if self.flip_sin_to_cos:
-            out = torch.cat([torch.cos(x_proj), torch.sin(x_proj)], dim=-1)
+            out = paddle.concat([paddle.cos(x_proj), paddle.sin(x_proj)], axis=-1)
         else:
-            out = torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+            out = paddle.concat([paddle.sin(x_proj), paddle.cos(x_proj)], axis=-1)
         return out
 
 
-class ImagePositionalEmbeddings(nn.Module):
+class ImagePositionalEmbeddings(nn.Layer):
     """
     Converts latent image classes into vector embeddings. Sums the vector embeddings with positional embeddings for the
     height and width of the latent space.
@@ -304,12 +304,12 @@ class ImagePositionalEmbeddings(nn.Module):
     def forward(self, index):
         emb = self.emb(index)
 
-        height_emb = self.height_emb(torch.arange(self.height, device=index.device).view(1, self.height))
+        height_emb = self.height_emb(paddle.arange(self.height).reshape([1, self.height]))
 
         # 1 x H x D -> 1 x H x 1 x D
         height_emb = height_emb.unsqueeze(2)
 
-        width_emb = self.width_emb(torch.arange(self.width, device=index.device).view(1, self.width))
+        width_emb = self.width_emb(paddle.arange(self.width).reshape([1, self.width]))
 
         # 1 x W x D -> 1 x 1 x W x D
         width_emb = width_emb.unsqueeze(1)
@@ -317,14 +317,14 @@ class ImagePositionalEmbeddings(nn.Module):
         pos_emb = height_emb + width_emb
 
         # 1 x H x W x D -> 1 x L xD
-        pos_emb = pos_emb.view(1, self.height * self.width, -1)
+        pos_emb = pos_emb.reshape([1, self.height * self.width, -1])
 
         emb = emb + pos_emb[:, : emb.shape[1], :]
 
         return emb
 
 
-class LabelEmbedding(nn.Module):
+class LabelEmbedding(nn.Layer):
     """
     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
 
@@ -346,10 +346,15 @@ class LabelEmbedding(nn.Module):
         Drops labels to enable classifier-free guidance.
         """
         if force_drop_ids is None:
-            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
+            drop_ids = (
+                paddle.rand(
+                    (labels.shape[0],),
+                )
+                < self.dropout_prob
+            )
         else:
-            drop_ids = torch.tensor(force_drop_ids == 1)
-        labels = torch.where(drop_ids, self.num_classes, labels)
+            drop_ids = paddle.to_tensor(force_drop_ids == 1)
+        labels = paddle.where(drop_ids, self.num_classes, labels)
         return labels
 
     def forward(self, labels, force_drop_ids=None):
@@ -360,7 +365,7 @@ class LabelEmbedding(nn.Module):
         return embeddings
 
 
-class CombinedTimestepLabelEmbeddings(nn.Module):
+class CombinedTimestepLabelEmbeddings(nn.Layer):
     def __init__(self, num_classes, embedding_dim, class_dropout_prob=0.1):
         super().__init__()
 

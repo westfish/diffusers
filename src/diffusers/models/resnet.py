@@ -1,14 +1,28 @@
+# Copyright (c) 2023 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from functools import partial
 from typing import Optional
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import paddle
+import paddle.nn as nn
+import paddle.nn.functional as F
 
 from .attention import AdaGroupNorm
 
 
-class Upsample1D(nn.Module):
+class Upsample1D(nn.Layer):
     """
     An upsampling layer with an optional convolution.
 
@@ -29,9 +43,9 @@ class Upsample1D(nn.Module):
 
         self.conv = None
         if use_conv_transpose:
-            self.conv = nn.ConvTranspose1d(channels, self.out_channels, 4, 2, 1)
+            self.conv = nn.Conv1DTranspose(channels, self.out_channels, 4, 2, 1)
         elif use_conv:
-            self.conv = nn.Conv1d(self.channels, self.out_channels, 3, padding=1)
+            self.conv = nn.Conv1D(self.channels, self.out_channels, 3, padding=1)
 
     def forward(self, x):
         assert x.shape[1] == self.channels
@@ -46,7 +60,7 @@ class Upsample1D(nn.Module):
         return x
 
 
-class Downsample1D(nn.Module):
+class Downsample1D(nn.Layer):
     """
     A downsampling layer with an optional convolution.
 
@@ -67,17 +81,17 @@ class Downsample1D(nn.Module):
         self.name = name
 
         if use_conv:
-            self.conv = nn.Conv1d(self.channels, self.out_channels, 3, stride=stride, padding=padding)
+            self.conv = nn.Conv1D(self.channels, self.out_channels, 3, stride=stride, padding=padding)
         else:
             assert self.channels == self.out_channels
-            self.conv = nn.AvgPool1d(kernel_size=stride, stride=stride)
+            self.conv = nn.AvgPool1D(kernel_size=stride, stride=stride)
 
     def forward(self, x):
         assert x.shape[1] == self.channels
         return self.conv(x)
 
 
-class Upsample2D(nn.Module):
+class Upsample2D(nn.Layer):
     """
     An upsampling layer with an optional convolution.
 
@@ -98,9 +112,9 @@ class Upsample2D(nn.Module):
 
         conv = None
         if use_conv_transpose:
-            conv = nn.ConvTranspose2d(channels, self.out_channels, 4, 2, 1)
+            conv = nn.Conv2DTranspose(channels, self.out_channels, 4, 2, 1)
         elif use_conv:
-            conv = nn.Conv2d(self.channels, self.out_channels, 3, padding=1)
+            conv = nn.Conv2D(self.channels, self.out_channels, 3, padding=1)
 
         # TODO(Suraj, Patrick) - clean up after weight dicts are correctly renamed
         if name == "conv":
@@ -118,12 +132,8 @@ class Upsample2D(nn.Module):
         # TODO(Suraj): Remove this cast once the issue is fixed in PyTorch
         # https://github.com/pytorch/pytorch/issues/86679
         dtype = hidden_states.dtype
-        if dtype == torch.bfloat16:
-            hidden_states = hidden_states.to(torch.float32)
-
-        # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
-        if hidden_states.shape[0] >= 64:
-            hidden_states = hidden_states.contiguous()
+        if dtype == paddle.bfloat16:
+            hidden_states = hidden_states.cast("float32")
 
         # if `output_size` is passed we force the interpolation output
         # size and do not make use of `scale_factor=2`
@@ -133,8 +143,8 @@ class Upsample2D(nn.Module):
             hidden_states = F.interpolate(hidden_states, size=output_size, mode="nearest")
 
         # If the input is bfloat16, we cast back to bfloat16
-        if dtype == torch.bfloat16:
-            hidden_states = hidden_states.to(dtype)
+        if dtype == paddle.bfloat16:
+            hidden_states = hidden_states.cast(dtype)
 
         # TODO(Suraj, Patrick) - clean up after weight dicts are correctly renamed
         if self.use_conv:
@@ -146,7 +156,7 @@ class Upsample2D(nn.Module):
         return hidden_states
 
 
-class Downsample2D(nn.Module):
+class Downsample2D(nn.Layer):
     """
     A downsampling layer with an optional convolution.
 
@@ -167,10 +177,10 @@ class Downsample2D(nn.Module):
         self.name = name
 
         if use_conv:
-            conv = nn.Conv2d(self.channels, self.out_channels, 3, stride=stride, padding=padding)
+            conv = nn.Conv2D(self.channels, self.out_channels, 3, stride=stride, padding=padding)
         else:
             assert self.channels == self.out_channels
-            conv = nn.AvgPool2d(kernel_size=stride, stride=stride)
+            conv = nn.AvgPool2D(kernel_size=stride, stride=stride)
 
         # TODO(Suraj, Patrick) - clean up after weight dicts are correctly renamed
         if name == "conv":
@@ -193,12 +203,12 @@ class Downsample2D(nn.Module):
         return hidden_states
 
 
-class FirUpsample2D(nn.Module):
+class FirUpsample2D(nn.Layer):
     def __init__(self, channels=None, out_channels=None, use_conv=False, fir_kernel=(1, 3, 3, 1)):
         super().__init__()
         out_channels = out_channels if out_channels else channels
         if use_conv:
-            self.Conv2d_0 = nn.Conv2d(channels, out_channels, kernel_size=3, stride=1, padding=1)
+            self.Conv2d_0 = nn.Conv2D(channels, out_channels, kernel_size=3, stride=1, padding=1)
         self.use_conv = use_conv
         self.fir_kernel = fir_kernel
         self.out_channels = out_channels
@@ -231,10 +241,10 @@ class FirUpsample2D(nn.Module):
             kernel = [1] * factor
 
         # setup kernel
-        kernel = torch.tensor(kernel, dtype=torch.float32)
+        kernel = paddle.to_tensor(kernel, dtype="float32")
         if kernel.ndim == 1:
-            kernel = torch.outer(kernel, kernel)
-        kernel /= torch.sum(kernel)
+            kernel = paddle.outer(kernel, kernel)
+        kernel /= paddle.sum(kernel)
 
         kernel = kernel * (gain * (factor**2))
 
@@ -259,24 +269,24 @@ class FirUpsample2D(nn.Module):
             num_groups = hidden_states.shape[1] // inC
 
             # Transpose weights.
-            weight = torch.reshape(weight, (num_groups, -1, inC, convH, convW))
-            weight = torch.flip(weight, dims=[3, 4]).permute(0, 2, 1, 3, 4)
-            weight = torch.reshape(weight, (num_groups * inC, -1, convH, convW))
+            weight = weight.reshape([num_groups, -1, inC, convH, convW])
+            weight = paddle.flip(weight, axis=[3, 4]).transpose([0, 2, 1, 3, 4])
+            weight = weight.reshape([num_groups * inC, -1, convH, convW])
 
-            inverse_conv = F.conv_transpose2d(
+            inverse_conv = F.conv2d_transpose(
                 hidden_states, weight, stride=stride, output_padding=output_padding, padding=0
             )
 
             output = upfirdn2d_native(
                 inverse_conv,
-                torch.tensor(kernel, device=inverse_conv.device),
+                paddle.to_tensor(kernel),
                 pad=((pad_value + 1) // 2 + factor - 1, pad_value // 2 + 1),
             )
         else:
             pad_value = kernel.shape[0] - factor
             output = upfirdn2d_native(
                 hidden_states,
-                torch.tensor(kernel, device=hidden_states.device),
+                paddle.to_tensor(kernel),
                 up=factor,
                 pad=((pad_value + 1) // 2 + factor - 1, pad_value // 2),
             )
@@ -286,19 +296,19 @@ class FirUpsample2D(nn.Module):
     def forward(self, hidden_states):
         if self.use_conv:
             height = self._upsample_2d(hidden_states, self.Conv2d_0.weight, kernel=self.fir_kernel)
-            height = height + self.Conv2d_0.bias.reshape(1, -1, 1, 1)
+            height = height + self.Conv2d_0.bias.reshape([1, -1, 1, 1])
         else:
             height = self._upsample_2d(hidden_states, kernel=self.fir_kernel, factor=2)
 
         return height
 
 
-class FirDownsample2D(nn.Module):
+class FirDownsample2D(nn.Layer):
     def __init__(self, channels=None, out_channels=None, use_conv=False, fir_kernel=(1, 3, 3, 1)):
         super().__init__()
         out_channels = out_channels if out_channels else channels
         if use_conv:
-            self.Conv2d_0 = nn.Conv2d(channels, out_channels, kernel_size=3, stride=1, padding=1)
+            self.Conv2d_0 = nn.Conv2D(channels, out_channels, kernel_size=3, stride=1, padding=1)
         self.fir_kernel = fir_kernel
         self.use_conv = use_conv
         self.out_channels = out_channels
@@ -329,10 +339,10 @@ class FirDownsample2D(nn.Module):
             kernel = [1] * factor
 
         # setup kernel
-        kernel = torch.tensor(kernel, dtype=torch.float32)
+        kernel = paddle.to_tensor(kernel, dtype="float32")
         if kernel.ndim == 1:
-            kernel = torch.outer(kernel, kernel)
-        kernel /= torch.sum(kernel)
+            kernel = paddle.outer(kernel, kernel)
+        kernel /= paddle.sum(kernel)
 
         kernel = kernel * gain
 
@@ -342,7 +352,7 @@ class FirDownsample2D(nn.Module):
             stride_value = [factor, factor]
             upfirdn_input = upfirdn2d_native(
                 hidden_states,
-                torch.tensor(kernel, device=hidden_states.device),
+                paddle.to_tensor(kernel),
                 pad=((pad_value + 1) // 2, pad_value // 2),
             )
             output = F.conv2d(upfirdn_input, weight, stride=stride_value, padding=0)
@@ -350,7 +360,7 @@ class FirDownsample2D(nn.Module):
             pad_value = kernel.shape[0] - factor
             output = upfirdn2d_native(
                 hidden_states,
-                torch.tensor(kernel, device=hidden_states.device),
+                paddle.to_tensor(kernel),
                 down=factor,
                 pad=((pad_value + 1) // 2, pad_value // 2),
             )
@@ -360,7 +370,7 @@ class FirDownsample2D(nn.Module):
     def forward(self, hidden_states):
         if self.use_conv:
             downsample_input = self._downsample_2d(hidden_states, weight=self.Conv2d_0.weight, kernel=self.fir_kernel)
-            hidden_states = downsample_input + self.Conv2d_0.bias.reshape(1, -1, 1, 1)
+            hidden_states = downsample_input + self.Conv2d_0.bias.reshape([1, -1, 1, 1])
         else:
             hidden_states = self._downsample_2d(hidden_states, kernel=self.fir_kernel, factor=2)
 
@@ -368,39 +378,41 @@ class FirDownsample2D(nn.Module):
 
 
 # downsample/upsample layer used in k-upscaler, might be able to use FirDownsample2D/DirUpsample2D instead
-class KDownsample2D(nn.Module):
+class KDownsample2D(nn.Layer):
     def __init__(self, pad_mode="reflect"):
         super().__init__()
         self.pad_mode = pad_mode
-        kernel_1d = torch.tensor([[1 / 8, 3 / 8, 3 / 8, 1 / 8]])
+        kernel_1d = pad_mode.to_tensor([[1 / 8, 3 / 8, 3 / 8, 1 / 8]])
         self.pad = kernel_1d.shape[1] // 2 - 1
-        self.register_buffer("kernel", kernel_1d.T @ kernel_1d, persistent=False)
+        self.register_buffer("kernel", paddle.matmul(kernel_1d, kernel_1d, transpose_x=True), persistable=False)
 
     def forward(self, x):
         x = F.pad(x, (self.pad,) * 4, self.pad_mode)
-        weight = x.new_zeros([x.shape[1], x.shape[1], self.kernel.shape[0], self.kernel.shape[1]])
-        indices = torch.arange(x.shape[1], device=x.device)
-        weight[indices, indices] = self.kernel.to(weight)
+        weight = paddle.zeros([x.shape[1], x.shape[1], self.kernel.shape[0], self.kernel.shape[1]], dtype=x.dtype)
+        indices = paddle.arange(x.shape[1])
+        # TODO verify this method
+        weight[indices, indices] = self.kernel.cast(weight.dtype)
         return F.conv2d(x, weight, stride=2)
 
 
-class KUpsample2D(nn.Module):
+class KUpsample2D(nn.Layer):
     def __init__(self, pad_mode="reflect"):
         super().__init__()
         self.pad_mode = pad_mode
-        kernel_1d = torch.tensor([[1 / 8, 3 / 8, 3 / 8, 1 / 8]]) * 2
+        kernel_1d = paddle.to_tensor([[1 / 8, 3 / 8, 3 / 8, 1 / 8]]) * 2
         self.pad = kernel_1d.shape[1] // 2 - 1
-        self.register_buffer("kernel", kernel_1d.T @ kernel_1d, persistent=False)
+        self.register_buffer("kernel", paddle.matmul(kernel_1d, kernel_1d, transpose_x=True), persistable=False)
 
     def forward(self, x):
         x = F.pad(x, ((self.pad + 1) // 2,) * 4, self.pad_mode)
-        weight = x.new_zeros([x.shape[1], x.shape[1], self.kernel.shape[0], self.kernel.shape[1]])
-        indices = torch.arange(x.shape[1], device=x.device)
-        weight[indices, indices] = self.kernel.to(weight)
+        weight = paddle.zeros([x.shape[1], x.shape[1], self.kernel.shape[0], self.kernel.shape[1]], dtype=x.dtype)
+        indices = paddle.arange(x.shape[1])
+        # TODO verify this method
+        weight[indices, indices] = self.kernel.cast(weight.dtype)
         return F.conv_transpose2d(x, weight, stride=2, padding=self.pad * 2 + 1)
 
 
-class ResnetBlock2D(nn.Module):
+class ResnetBlock2D(nn.Layer):
     r"""
     A Resnet block.
 
@@ -418,7 +430,7 @@ class ResnetBlock2D(nn.Module):
         time_embedding_norm (`str`, *optional*, default to `"default"` ): Time scale shift config.
             By default, apply timestep embedding conditioning with a simple shift mechanism. Choose "scale_shift" or
             "ada_group" for a stronger conditioning with scale and shift.
-        kernal (`torch.FloatTensor`, optional, default to None): FIR filter, see
+        kernal (`paddle.Tensor`, optional, default to None): FIR filter, see
             [`~models.resnet.FirUpsample2D`] and [`~models.resnet.FirDownsample2D`].
         output_scale_factor (`float`, *optional*, default to be `1.0`): the scale factor to use for the output.
         use_in_shortcut (`bool`, *optional*, default to `True`):
@@ -452,8 +464,10 @@ class ResnetBlock2D(nn.Module):
         down=False,
         conv_shortcut_bias: bool = True,
         conv_2d_out_channels: Optional[int] = None,
+        pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
+        self.pre_temb_non_linearity = pre_temb_non_linearity
         self.pre_norm = pre_norm
         self.pre_norm = True
         self.in_channels = in_channels
@@ -471,15 +485,15 @@ class ResnetBlock2D(nn.Module):
         if self.time_embedding_norm == "ada_group":
             self.norm1 = AdaGroupNorm(temb_channels, in_channels, groups, eps=eps)
         else:
-            self.norm1 = torch.nn.GroupNorm(num_groups=groups, num_channels=in_channels, eps=eps, affine=True)
+            self.norm1 = nn.GroupNorm(num_groups=groups, num_channels=in_channels, epsilon=eps)
 
-        self.conv1 = torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.conv1 = nn.Conv2D(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
 
         if temb_channels is not None:
             if self.time_embedding_norm == "default":
-                self.time_emb_proj = torch.nn.Linear(temb_channels, out_channels)
+                self.time_emb_proj = nn.Linear(temb_channels, out_channels)
             elif self.time_embedding_norm == "scale_shift":
-                self.time_emb_proj = torch.nn.Linear(temb_channels, 2 * out_channels)
+                self.time_emb_proj = nn.Linear(temb_channels, 2 * out_channels)
             elif self.time_embedding_norm == "ada_group":
                 self.time_emb_proj = None
             else:
@@ -490,18 +504,18 @@ class ResnetBlock2D(nn.Module):
         if self.time_embedding_norm == "ada_group":
             self.norm2 = AdaGroupNorm(temb_channels, out_channels, groups_out, eps=eps)
         else:
-            self.norm2 = torch.nn.GroupNorm(num_groups=groups_out, num_channels=out_channels, eps=eps, affine=True)
+            self.norm2 = nn.GroupNorm(num_groups=groups_out, num_channels=out_channels, epsilon=eps)
 
-        self.dropout = torch.nn.Dropout(dropout)
+        self.dropout = nn.Dropout(dropout)
         conv_2d_out_channels = conv_2d_out_channels or out_channels
-        self.conv2 = torch.nn.Conv2d(out_channels, conv_2d_out_channels, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2D(out_channels, conv_2d_out_channels, kernel_size=3, stride=1, padding=1)
 
         if non_linearity == "swish":
             self.nonlinearity = lambda x: F.silu(x)
         elif non_linearity == "mish":
             self.nonlinearity = nn.Mish()
         elif non_linearity == "silu":
-            self.nonlinearity = nn.SiLU()
+            self.nonlinearity = nn.Silu()
         elif non_linearity == "gelu":
             self.nonlinearity = nn.GELU()
 
@@ -527,8 +541,8 @@ class ResnetBlock2D(nn.Module):
 
         self.conv_shortcut = None
         if self.use_in_shortcut:
-            self.conv_shortcut = torch.nn.Conv2d(
-                in_channels, conv_2d_out_channels, kernel_size=1, stride=1, padding=0, bias=conv_shortcut_bias
+            self.conv_shortcut = nn.Conv2D(
+                in_channels, conv_2d_out_channels, kernel_size=1, stride=1, padding=0, bias_attr=conv_shortcut_bias
             )
 
     def forward(self, input_tensor, temb):
@@ -542,10 +556,6 @@ class ResnetBlock2D(nn.Module):
         hidden_states = self.nonlinearity(hidden_states)
 
         if self.upsample is not None:
-            # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
-            if hidden_states.shape[0] >= 64:
-                input_tensor = input_tensor.contiguous()
-                hidden_states = hidden_states.contiguous()
             input_tensor = self.upsample(input_tensor)
             hidden_states = self.upsample(hidden_states)
         elif self.downsample is not None:
@@ -554,8 +564,11 @@ class ResnetBlock2D(nn.Module):
 
         hidden_states = self.conv1(hidden_states)
 
-        if self.time_emb_proj is not None:
-            temb = self.time_emb_proj(self.nonlinearity(temb))[:, :, None, None]
+        if temb is not None:
+            if not self.pre_temb_non_linearity:
+                temb = self.time_emb_proj(self.nonlinearity(temb))[:, :, None, None]
+            else:
+                temb = self.time_emb_proj(temb)[:, :, None, None]
 
         if temb is not None and self.time_embedding_norm == "default":
             hidden_states = hidden_states + temb
@@ -566,7 +579,7 @@ class ResnetBlock2D(nn.Module):
             hidden_states = self.norm2(hidden_states)
 
         if temb is not None and self.time_embedding_norm == "scale_shift":
-            scale, shift = torch.chunk(temb, 2, dim=1)
+            scale, shift = temb.chunk(2, axis=1)
             hidden_states = hidden_states * (1 + scale) + shift
 
         hidden_states = self.nonlinearity(hidden_states)
@@ -582,9 +595,9 @@ class ResnetBlock2D(nn.Module):
         return output_tensor
 
 
-class Mish(torch.nn.Module):
+class Mish(nn.Layer):
     def forward(self, hidden_states):
-        return hidden_states * torch.tanh(torch.nn.functional.softplus(hidden_states))
+        return hidden_states * paddle.tanh(F.softplus(hidden_states))
 
 
 # unet_rl.py
@@ -599,7 +612,7 @@ def rearrange_dims(tensor):
         raise ValueError(f"`len(tensor)`: {len(tensor)} has to be 2, 3 or 4.")
 
 
-class Conv1dBlock(nn.Module):
+class Conv1dBlock(nn.Layer):
     """
     Conv1d --> GroupNorm --> Mish
     """
@@ -607,7 +620,7 @@ class Conv1dBlock(nn.Module):
     def __init__(self, inp_channels, out_channels, kernel_size, n_groups=8):
         super().__init__()
 
-        self.conv1d = nn.Conv1d(inp_channels, out_channels, kernel_size, padding=kernel_size // 2)
+        self.conv1d = nn.Conv1D(inp_channels, out_channels, kernel_size, padding=kernel_size // 2)
         self.group_norm = nn.GroupNorm(n_groups, out_channels)
         self.mish = nn.Mish()
 
@@ -621,7 +634,7 @@ class Conv1dBlock(nn.Module):
 
 
 # unet_rl.py
-class ResidualTemporalBlock1D(nn.Module):
+class ResidualTemporalBlock1D(nn.Layer):
     def __init__(self, inp_channels, out_channels, embed_dim, kernel_size=5):
         super().__init__()
         self.conv_in = Conv1dBlock(inp_channels, out_channels, kernel_size)
@@ -631,7 +644,7 @@ class ResidualTemporalBlock1D(nn.Module):
         self.time_emb = nn.Linear(embed_dim, out_channels)
 
         self.residual_conv = (
-            nn.Conv1d(inp_channels, out_channels, 1) if inp_channels != out_channels else nn.Identity()
+            nn.Conv1D(inp_channels, out_channels, 1) if inp_channels != out_channels else nn.Identity()
         )
 
     def forward(self, x, t):
@@ -671,16 +684,16 @@ def upsample_2d(hidden_states, kernel=None, factor=2, gain=1):
     if kernel is None:
         kernel = [1] * factor
 
-    kernel = torch.tensor(kernel, dtype=torch.float32)
+    kernel = paddle.to_tensor(kernel, dtype=paddle.float32)
     if kernel.ndim == 1:
-        kernel = torch.outer(kernel, kernel)
-    kernel /= torch.sum(kernel)
+        kernel = paddle.outer(kernel, kernel)
+    kernel /= paddle.sum(kernel)
 
     kernel = kernel * (gain * (factor**2))
     pad_value = kernel.shape[0] - factor
     output = upfirdn2d_native(
         hidden_states,
-        kernel.to(device=hidden_states.device),
+        kernel,
         up=factor,
         pad=((pad_value + 1) // 2 + factor - 1, pad_value // 2),
     )
@@ -709,17 +722,41 @@ def downsample_2d(hidden_states, kernel=None, factor=2, gain=1):
     if kernel is None:
         kernel = [1] * factor
 
-    kernel = torch.tensor(kernel, dtype=torch.float32)
+    kernel = paddle.to_tensor(kernel, dtype=paddle.float32)
     if kernel.ndim == 1:
-        kernel = torch.outer(kernel, kernel)
-    kernel /= torch.sum(kernel)
+        kernel = paddle.outer(kernel, kernel)
+    kernel /= paddle.sum(kernel)
 
     kernel = kernel * gain
     pad_value = kernel.shape[0] - factor
-    output = upfirdn2d_native(
-        hidden_states, kernel.to(device=hidden_states.device), down=factor, pad=((pad_value + 1) // 2, pad_value // 2)
-    )
+    output = upfirdn2d_native(hidden_states, kernel, down=factor, pad=((pad_value + 1) // 2, pad_value // 2))
     return output
+
+
+def dummy_pad(tensor, up_x=0, up_y=0):
+    if up_x > 0:
+        tensor = paddle.concat(
+            [
+                tensor,
+                paddle.zeros(
+                    [tensor.shape[0], tensor.shape[1], tensor.shape[2], tensor.shape[3], up_x, tensor.shape[5]],
+                    dtype=tensor.dtype,
+                ),
+            ],
+            axis=4,
+        )
+    if up_y > 0:
+        tensor = paddle.concat(
+            [
+                tensor,
+                paddle.zeros(
+                    [tensor.shape[0], tensor.shape[1], up_y, tensor.shape[3], tensor.shape[4], tensor.shape[5]],
+                    dtype=tensor.dtype,
+                ),
+            ],
+            axis=2,
+        )
+    return tensor
 
 
 def upfirdn2d_native(tensor, kernel, up=1, down=1, pad=(0, 0)):
@@ -729,17 +766,23 @@ def upfirdn2d_native(tensor, kernel, up=1, down=1, pad=(0, 0)):
     pad_x1 = pad_y1 = pad[1]
 
     _, channel, in_h, in_w = tensor.shape
-    tensor = tensor.reshape(-1, in_h, in_w, 1)
+    tensor = tensor.reshape([-1, in_h, in_w, 1])
 
     _, in_h, in_w, minor = tensor.shape
     kernel_h, kernel_w = kernel.shape
 
-    out = tensor.view(-1, in_h, 1, in_w, 1, minor)
-    out = F.pad(out, [0, 0, 0, up_x - 1, 0, 0, 0, up_y - 1])
-    out = out.view(-1, in_h * up_y, in_w * up_x, minor)
+    out = tensor.reshape([-1, in_h, 1, in_w, 1, minor])
+    # (TODO, junnyu F.pad bug)
+    # F.pad(out, [0, 0, 0, up_x - 1, 0, 0, 0, up_y - 1])
+    out = dummy_pad(out, up_x - 1, up_y - 1)
+    out = out.reshape([-1, in_h * up_y, in_w * up_x, minor])
 
-    out = F.pad(out, [0, 0, max(pad_x0, 0), max(pad_x1, 0), max(pad_y0, 0), max(pad_y1, 0)])
-    out = out.to(tensor.device)  # Move back to mps if necessary
+    # (TODO, junnyu F.pad bug)
+    # out = F.pad(out, [0, 0, max(pad_x0, 0), max(pad_x1, 0), max(pad_y0, 0), max(pad_y1, 0)])
+    out = out.unsqueeze(0)
+    out = F.pad(out, [max(pad_x0, 0), max(pad_x1, 0), max(pad_y0, 0), max(pad_y1, 0), 0, 0], data_format="NDHWC")
+    out = out.squeeze(0)
+
     out = out[
         :,
         max(-pad_y0, 0) : out.shape[1] - max(-pad_y1, 0),
@@ -747,20 +790,17 @@ def upfirdn2d_native(tensor, kernel, up=1, down=1, pad=(0, 0)):
         :,
     ]
 
-    out = out.permute(0, 3, 1, 2)
+    out = out.transpose([0, 3, 1, 2])
     out = out.reshape([-1, 1, in_h * up_y + pad_y0 + pad_y1, in_w * up_x + pad_x0 + pad_x1])
-    w = torch.flip(kernel, [0, 1]).view(1, 1, kernel_h, kernel_w)
+    w = paddle.flip(kernel, [0, 1]).reshape([1, 1, kernel_h, kernel_w])
     out = F.conv2d(out, w)
     out = out.reshape(
-        -1,
-        minor,
-        in_h * up_y + pad_y0 + pad_y1 - kernel_h + 1,
-        in_w * up_x + pad_x0 + pad_x1 - kernel_w + 1,
+        [-1, minor, in_h * up_y + pad_y0 + pad_y1 - kernel_h + 1, in_w * up_x + pad_x0 + pad_x1 - kernel_w + 1]
     )
-    out = out.permute(0, 2, 3, 1)
+    out = out.transpose([0, 2, 3, 1])
     out = out[:, ::down_y, ::down_x, :]
 
     out_h = (in_h * up_y + pad_y0 + pad_y1 - kernel_h) // down_y + 1
     out_w = (in_w * up_x + pad_x0 + pad_x1 - kernel_w) // down_x + 1
 
-    return out.view(-1, channel, out_h, out_w)
+    return out.reshape([-1, channel, out_h, out_w])

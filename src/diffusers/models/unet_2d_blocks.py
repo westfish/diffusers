@@ -14,13 +14,22 @@
 from typing import Optional
 
 import numpy as np
-import torch
-from torch import nn
+import paddle
+from paddle import nn
+from paddle.distributed.fleet.utils import recompute
 
 from .attention import AdaGroupNorm, AttentionBlock
 from .cross_attention import CrossAttention, CrossAttnAddedKVProcessor
 from .dual_transformer_2d import DualTransformer2DModel
-from .resnet import Downsample2D, FirDownsample2D, FirUpsample2D, KDownsample2D, KUpsample2D, ResnetBlock2D, Upsample2D
+from .resnet import (
+    Downsample2D,
+    FirDownsample2D,
+    FirUpsample2D,
+    KDownsample2D,
+    KUpsample2D,
+    ResnetBlock2D,
+    Upsample2D,
+)
 from .transformer_2d import Transformer2DModel
 
 
@@ -42,6 +51,7 @@ def get_down_block(
     only_cross_attention=False,
     upcast_attention=False,
     resnet_time_scale_shift="default",
+    resnet_pre_temb_non_linearity=False,
 ):
     down_block_type = down_block_type[7:] if down_block_type.startswith("UNetRes") else down_block_type
     if down_block_type == "DownBlock2D":
@@ -56,6 +66,7 @@ def get_down_block(
             resnet_groups=resnet_groups,
             downsample_padding=downsample_padding,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif down_block_type == "ResnetDownsampleBlock2D":
         return ResnetDownsampleBlock2D(
@@ -68,6 +79,7 @@ def get_down_block(
             resnet_act_fn=resnet_act_fn,
             resnet_groups=resnet_groups,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif down_block_type == "AttnDownBlock2D":
         return AttnDownBlock2D(
@@ -82,6 +94,7 @@ def get_down_block(
             downsample_padding=downsample_padding,
             attn_num_head_channels=attn_num_head_channels,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif down_block_type == "CrossAttnDownBlock2D":
         if cross_attention_dim is None:
@@ -103,6 +116,7 @@ def get_down_block(
             only_cross_attention=only_cross_attention,
             upcast_attention=upcast_attention,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif down_block_type == "SimpleCrossAttnDownBlock2D":
         if cross_attention_dim is None:
@@ -119,6 +133,7 @@ def get_down_block(
             cross_attention_dim=cross_attention_dim,
             attn_num_head_channels=attn_num_head_channels,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif down_block_type == "SkipDownBlock2D":
         return SkipDownBlock2D(
@@ -131,6 +146,7 @@ def get_down_block(
             resnet_act_fn=resnet_act_fn,
             downsample_padding=downsample_padding,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif down_block_type == "AttnSkipDownBlock2D":
         return AttnSkipDownBlock2D(
@@ -144,6 +160,7 @@ def get_down_block(
             downsample_padding=downsample_padding,
             attn_num_head_channels=attn_num_head_channels,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif down_block_type == "DownEncoderBlock2D":
         return DownEncoderBlock2D(
@@ -156,6 +173,7 @@ def get_down_block(
             resnet_groups=resnet_groups,
             downsample_padding=downsample_padding,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif down_block_type == "AttnDownEncoderBlock2D":
         return AttnDownEncoderBlock2D(
@@ -169,6 +187,7 @@ def get_down_block(
             downsample_padding=downsample_padding,
             attn_num_head_channels=attn_num_head_channels,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif down_block_type == "KDownBlock2D":
         return KDownBlock2D(
@@ -179,6 +198,7 @@ def get_down_block(
             add_downsample=add_downsample,
             resnet_eps=resnet_eps,
             resnet_act_fn=resnet_act_fn,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif down_block_type == "KCrossAttnDownBlock2D":
         return KCrossAttnDownBlock2D(
@@ -192,6 +212,7 @@ def get_down_block(
             cross_attention_dim=cross_attention_dim,
             attn_num_head_channels=attn_num_head_channels,
             add_self_attention=True if not add_downsample else False,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     raise ValueError(f"{down_block_type} does not exist.")
 
@@ -214,6 +235,7 @@ def get_up_block(
     only_cross_attention=False,
     upcast_attention=False,
     resnet_time_scale_shift="default",
+    resnet_pre_temb_non_linearity=False,
 ):
     up_block_type = up_block_type[7:] if up_block_type.startswith("UNetRes") else up_block_type
     if up_block_type == "UpBlock2D":
@@ -228,6 +250,7 @@ def get_up_block(
             resnet_act_fn=resnet_act_fn,
             resnet_groups=resnet_groups,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif up_block_type == "ResnetUpsampleBlock2D":
         return ResnetUpsampleBlock2D(
@@ -241,6 +264,7 @@ def get_up_block(
             resnet_act_fn=resnet_act_fn,
             resnet_groups=resnet_groups,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif up_block_type == "CrossAttnUpBlock2D":
         if cross_attention_dim is None:
@@ -262,6 +286,7 @@ def get_up_block(
             only_cross_attention=only_cross_attention,
             upcast_attention=upcast_attention,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif up_block_type == "SimpleCrossAttnUpBlock2D":
         if cross_attention_dim is None:
@@ -279,6 +304,7 @@ def get_up_block(
             cross_attention_dim=cross_attention_dim,
             attn_num_head_channels=attn_num_head_channels,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif up_block_type == "AttnUpBlock2D":
         return AttnUpBlock2D(
@@ -293,6 +319,7 @@ def get_up_block(
             resnet_groups=resnet_groups,
             attn_num_head_channels=attn_num_head_channels,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif up_block_type == "SkipUpBlock2D":
         return SkipUpBlock2D(
@@ -305,6 +332,7 @@ def get_up_block(
             resnet_eps=resnet_eps,
             resnet_act_fn=resnet_act_fn,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif up_block_type == "AttnSkipUpBlock2D":
         return AttnSkipUpBlock2D(
@@ -318,6 +346,7 @@ def get_up_block(
             resnet_act_fn=resnet_act_fn,
             attn_num_head_channels=attn_num_head_channels,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif up_block_type == "UpDecoderBlock2D":
         return UpDecoderBlock2D(
@@ -329,6 +358,7 @@ def get_up_block(
             resnet_act_fn=resnet_act_fn,
             resnet_groups=resnet_groups,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif up_block_type == "AttnUpDecoderBlock2D":
         return AttnUpDecoderBlock2D(
@@ -341,6 +371,7 @@ def get_up_block(
             resnet_groups=resnet_groups,
             attn_num_head_channels=attn_num_head_channels,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif up_block_type == "KUpBlock2D":
         return KUpBlock2D(
@@ -351,6 +382,7 @@ def get_up_block(
             add_upsample=add_upsample,
             resnet_eps=resnet_eps,
             resnet_act_fn=resnet_act_fn,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
     elif up_block_type == "KCrossAttnUpBlock2D":
         return KCrossAttnUpBlock2D(
@@ -363,12 +395,13 @@ def get_up_block(
             resnet_act_fn=resnet_act_fn,
             cross_attention_dim=cross_attention_dim,
             attn_num_head_channels=attn_num_head_channels,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
 
     raise ValueError(f"{up_block_type} does not exist.")
 
 
-class UNetMidBlock2D(nn.Module):
+class UNetMidBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -381,8 +414,9 @@ class UNetMidBlock2D(nn.Module):
         resnet_groups: int = 32,
         resnet_pre_norm: bool = True,
         add_attention: bool = True,
-        attn_num_head_channels=1,
-        output_scale_factor=1.0,
+        attn_num_head_channels: int = 1,
+        output_scale_factor: float = 1.0,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
         resnet_groups = resnet_groups if resnet_groups is not None else min(in_channels // 4, 32)
@@ -401,6 +435,7 @@ class UNetMidBlock2D(nn.Module):
                 non_linearity=resnet_act_fn,
                 output_scale_factor=output_scale_factor,
                 pre_norm=resnet_pre_norm,
+                pre_temb_non_linearity=resnet_pre_temb_non_linearity,
             )
         ]
         attentions = []
@@ -431,11 +466,12 @@ class UNetMidBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
 
-        self.attentions = nn.ModuleList(attentions)
-        self.resnets = nn.ModuleList(resnets)
+        self.attentions = nn.LayerList(attentions)
+        self.resnets = nn.LayerList(resnets)
 
     def forward(self, hidden_states, temb=None):
         hidden_states = self.resnets[0](hidden_states, temb)
@@ -447,7 +483,7 @@ class UNetMidBlock2D(nn.Module):
         return hidden_states
 
 
-class UNetMidBlock2DCrossAttn(nn.Module):
+class UNetMidBlock2DCrossAttn(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -459,12 +495,13 @@ class UNetMidBlock2DCrossAttn(nn.Module):
         resnet_act_fn: str = "swish",
         resnet_groups: int = 32,
         resnet_pre_norm: bool = True,
-        attn_num_head_channels=1,
-        output_scale_factor=1.0,
-        cross_attention_dim=1280,
-        dual_cross_attention=False,
-        use_linear_projection=False,
-        upcast_attention=False,
+        attn_num_head_channels: int = 1,
+        output_scale_factor: float = 1.0,
+        cross_attention_dim: int = 1280,
+        dual_cross_attention: bool = False,
+        use_linear_projection: bool = False,
+        upcast_attention: bool = False,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
 
@@ -485,6 +522,7 @@ class UNetMidBlock2DCrossAttn(nn.Module):
                 non_linearity=resnet_act_fn,
                 output_scale_factor=output_scale_factor,
                 pre_norm=resnet_pre_norm,
+                pre_temb_non_linearity=resnet_pre_temb_non_linearity,
             )
         ]
         attentions = []
@@ -526,11 +564,12 @@ class UNetMidBlock2DCrossAttn(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
 
-        self.attentions = nn.ModuleList(attentions)
-        self.resnets = nn.ModuleList(resnets)
+        self.attentions = nn.LayerList(attentions)
+        self.resnets = nn.LayerList(resnets)
 
     def forward(
         self, hidden_states, temb=None, encoder_hidden_states=None, attention_mask=None, cross_attention_kwargs=None
@@ -547,7 +586,7 @@ class UNetMidBlock2DCrossAttn(nn.Module):
         return hidden_states
 
 
-class UNetMidBlock2DSimpleCrossAttn(nn.Module):
+class UNetMidBlock2DSimpleCrossAttn(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -559,9 +598,10 @@ class UNetMidBlock2DSimpleCrossAttn(nn.Module):
         resnet_act_fn: str = "swish",
         resnet_groups: int = 32,
         resnet_pre_norm: bool = True,
-        attn_num_head_channels=1,
-        output_scale_factor=1.0,
-        cross_attention_dim=1280,
+        attn_num_head_channels: int = 1,
+        output_scale_factor: float = 1.0,
+        cross_attention_dim: int = 1280,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
 
@@ -585,6 +625,7 @@ class UNetMidBlock2DSimpleCrossAttn(nn.Module):
                 non_linearity=resnet_act_fn,
                 output_scale_factor=output_scale_factor,
                 pre_norm=resnet_pre_norm,
+                pre_temb_non_linearity=resnet_pre_temb_non_linearity,
             )
         ]
         attentions = []
@@ -615,11 +656,12 @@ class UNetMidBlock2DSimpleCrossAttn(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
 
-        self.attentions = nn.ModuleList(attentions)
-        self.resnets = nn.ModuleList(resnets)
+        self.attentions = nn.LayerList(attentions)
+        self.resnets = nn.LayerList(resnets)
 
     def forward(
         self, hidden_states, temb=None, encoder_hidden_states=None, attention_mask=None, cross_attention_kwargs=None
@@ -641,7 +683,7 @@ class UNetMidBlock2DSimpleCrossAttn(nn.Module):
         return hidden_states
 
 
-class AttnDownBlock2D(nn.Module):
+class AttnDownBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -654,10 +696,11 @@ class AttnDownBlock2D(nn.Module):
         resnet_act_fn: str = "swish",
         resnet_groups: int = 32,
         resnet_pre_norm: bool = True,
-        attn_num_head_channels=1,
-        output_scale_factor=1.0,
-        downsample_padding=1,
-        add_downsample=True,
+        attn_num_head_channels: int = 1,
+        output_scale_factor: float = 1.0,
+        downsample_padding: int = 1,
+        add_downsample: bool = True,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
         resnets = []
@@ -677,6 +720,7 @@ class AttnDownBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
             attentions.append(
@@ -689,11 +733,11 @@ class AttnDownBlock2D(nn.Module):
                 )
             )
 
-        self.attentions = nn.ModuleList(attentions)
-        self.resnets = nn.ModuleList(resnets)
+        self.attentions = nn.LayerList(attentions)
+        self.resnets = nn.LayerList(resnets)
 
         if add_downsample:
-            self.downsamplers = nn.ModuleList(
+            self.downsamplers = nn.LayerList(
                 [
                     Downsample2D(
                         out_channels, use_conv=True, out_channels=out_channels, padding=downsample_padding, name="op"
@@ -720,7 +764,7 @@ class AttnDownBlock2D(nn.Module):
         return hidden_states, output_states
 
 
-class CrossAttnDownBlock2D(nn.Module):
+class CrossAttnDownBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -733,15 +777,16 @@ class CrossAttnDownBlock2D(nn.Module):
         resnet_act_fn: str = "swish",
         resnet_groups: int = 32,
         resnet_pre_norm: bool = True,
-        attn_num_head_channels=1,
-        cross_attention_dim=1280,
-        output_scale_factor=1.0,
-        downsample_padding=1,
-        add_downsample=True,
-        dual_cross_attention=False,
-        use_linear_projection=False,
-        only_cross_attention=False,
-        upcast_attention=False,
+        attn_num_head_channels: int = 1,
+        cross_attention_dim: int = 1280,
+        output_scale_factor: float = 1.0,
+        downsample_padding: int = 1,
+        add_downsample: bool = True,
+        dual_cross_attention: bool = False,
+        use_linear_projection: bool = False,
+        only_cross_attention: bool = False,
+        upcast_attention: bool = False,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
         resnets = []
@@ -764,6 +809,7 @@ class CrossAttnDownBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
             if not dual_cross_attention:
@@ -791,11 +837,11 @@ class CrossAttnDownBlock2D(nn.Module):
                         norm_num_groups=resnet_groups,
                     )
                 )
-        self.attentions = nn.ModuleList(attentions)
-        self.resnets = nn.ModuleList(resnets)
+        self.attentions = nn.LayerList(attentions)
+        self.resnets = nn.LayerList(resnets)
 
         if add_downsample:
-            self.downsamplers = nn.ModuleList(
+            self.downsamplers = nn.LayerList(
                 [
                     Downsample2D(
                         out_channels, use_conv=True, out_channels=out_channels, padding=downsample_padding, name="op"
@@ -819,19 +865,19 @@ class CrossAttnDownBlock2D(nn.Module):
                 def create_custom_forward(module, return_dict=None):
                     def custom_forward(*inputs):
                         if return_dict is not None:
-                            return module(*inputs, return_dict=return_dict)
+                            return module(*inputs, return_dict=return_dict)[0]  # move [0] when paddlepaddle <= 2.4.1
                         else:
                             return module(*inputs)
 
                     return custom_forward
 
-                hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(resnet), hidden_states, temb)
-                hidden_states = torch.utils.checkpoint.checkpoint(
+                hidden_states = recompute(create_custom_forward(resnet), hidden_states, temb)
+                hidden_states = recompute(
                     create_custom_forward(attn, return_dict=False),
                     hidden_states,
                     encoder_hidden_states,
                     cross_attention_kwargs,
-                )[0]
+                )  # [0]
             else:
                 hidden_states = resnet(hidden_states, temb)
                 hidden_states = attn(
@@ -851,7 +897,7 @@ class CrossAttnDownBlock2D(nn.Module):
         return hidden_states, output_states
 
 
-class DownBlock2D(nn.Module):
+class DownBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -864,9 +910,10 @@ class DownBlock2D(nn.Module):
         resnet_act_fn: str = "swish",
         resnet_groups: int = 32,
         resnet_pre_norm: bool = True,
-        output_scale_factor=1.0,
-        add_downsample=True,
-        downsample_padding=1,
+        output_scale_factor: float = 1.0,
+        add_downsample: bool = True,
+        downsample_padding: int = 1,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
         resnets = []
@@ -885,13 +932,14 @@ class DownBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
 
-        self.resnets = nn.ModuleList(resnets)
+        self.resnets = nn.LayerList(resnets)
 
         if add_downsample:
-            self.downsamplers = nn.ModuleList(
+            self.downsamplers = nn.LayerList(
                 [
                     Downsample2D(
                         out_channels, use_conv=True, out_channels=out_channels, padding=downsample_padding, name="op"
@@ -915,7 +963,7 @@ class DownBlock2D(nn.Module):
 
                     return custom_forward
 
-                hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(resnet), hidden_states, temb)
+                hidden_states = recompute(create_custom_forward(resnet), hidden_states, temb)
             else:
                 hidden_states = resnet(hidden_states, temb)
 
@@ -930,7 +978,7 @@ class DownBlock2D(nn.Module):
         return hidden_states, output_states
 
 
-class DownEncoderBlock2D(nn.Module):
+class DownEncoderBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -942,9 +990,10 @@ class DownEncoderBlock2D(nn.Module):
         resnet_act_fn: str = "swish",
         resnet_groups: int = 32,
         resnet_pre_norm: bool = True,
-        output_scale_factor=1.0,
-        add_downsample=True,
-        downsample_padding=1,
+        output_scale_factor: float = 1.0,
+        add_downsample: bool = True,
+        downsample_padding: int = 1,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
         resnets = []
@@ -963,13 +1012,14 @@ class DownEncoderBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
 
-        self.resnets = nn.ModuleList(resnets)
+        self.resnets = nn.LayerList(resnets)
 
         if add_downsample:
-            self.downsamplers = nn.ModuleList(
+            self.downsamplers = nn.LayerList(
                 [
                     Downsample2D(
                         out_channels, use_conv=True, out_channels=out_channels, padding=downsample_padding, name="op"
@@ -990,7 +1040,7 @@ class DownEncoderBlock2D(nn.Module):
         return hidden_states
 
 
-class AttnDownEncoderBlock2D(nn.Module):
+class AttnDownEncoderBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -1002,10 +1052,11 @@ class AttnDownEncoderBlock2D(nn.Module):
         resnet_act_fn: str = "swish",
         resnet_groups: int = 32,
         resnet_pre_norm: bool = True,
-        attn_num_head_channels=1,
-        output_scale_factor=1.0,
-        add_downsample=True,
-        downsample_padding=1,
+        attn_num_head_channels: int = 1,
+        output_scale_factor: float = 1.0,
+        add_downsample: bool = True,
+        downsample_padding: int = 1,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
         resnets = []
@@ -1025,6 +1076,7 @@ class AttnDownEncoderBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
             attentions.append(
@@ -1037,11 +1089,11 @@ class AttnDownEncoderBlock2D(nn.Module):
                 )
             )
 
-        self.attentions = nn.ModuleList(attentions)
-        self.resnets = nn.ModuleList(resnets)
+        self.attentions = nn.LayerList(attentions)
+        self.resnets = nn.LayerList(resnets)
 
         if add_downsample:
-            self.downsamplers = nn.ModuleList(
+            self.downsamplers = nn.LayerList(
                 [
                     Downsample2D(
                         out_channels, use_conv=True, out_channels=out_channels, padding=downsample_padding, name="op"
@@ -1063,7 +1115,7 @@ class AttnDownEncoderBlock2D(nn.Module):
         return hidden_states
 
 
-class AttnSkipDownBlock2D(nn.Module):
+class AttnSkipDownBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -1075,14 +1127,15 @@ class AttnSkipDownBlock2D(nn.Module):
         resnet_time_scale_shift: str = "default",
         resnet_act_fn: str = "swish",
         resnet_pre_norm: bool = True,
-        attn_num_head_channels=1,
-        output_scale_factor=np.sqrt(2.0),
-        downsample_padding=1,
-        add_downsample=True,
+        attn_num_head_channels: int = 1,
+        output_scale_factor: float = np.sqrt(2.0),
+        downsample_padding: int = 1,
+        add_downsample: bool = True,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
-        self.attentions = nn.ModuleList([])
-        self.resnets = nn.ModuleList([])
+        self.attentions = nn.LayerList([])
+        self.resnets = nn.LayerList([])
 
         for i in range(num_layers):
             in_channels = in_channels if i == 0 else out_channels
@@ -1099,6 +1152,7 @@ class AttnSkipDownBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
             self.attentions.append(
@@ -1125,9 +1179,10 @@ class AttnSkipDownBlock2D(nn.Module):
                 use_in_shortcut=True,
                 down=True,
                 kernel="fir",
+                pre_temb_non_linearity=resnet_pre_temb_non_linearity,
             )
-            self.downsamplers = nn.ModuleList([FirDownsample2D(out_channels, out_channels=out_channels)])
-            self.skip_conv = nn.Conv2d(3, out_channels, kernel_size=(1, 1), stride=(1, 1))
+            self.downsamplers = nn.LayerList([FirDownsample2D(out_channels, out_channels=out_channels)])
+            self.skip_conv = nn.Conv2D(3, out_channels, kernel_size=(1, 1), stride=(1, 1))
         else:
             self.resnet_down = None
             self.downsamplers = None
@@ -1153,7 +1208,7 @@ class AttnSkipDownBlock2D(nn.Module):
         return hidden_states, output_states, skip_sample
 
 
-class SkipDownBlock2D(nn.Module):
+class SkipDownBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -1165,12 +1220,13 @@ class SkipDownBlock2D(nn.Module):
         resnet_time_scale_shift: str = "default",
         resnet_act_fn: str = "swish",
         resnet_pre_norm: bool = True,
-        output_scale_factor=np.sqrt(2.0),
-        add_downsample=True,
-        downsample_padding=1,
+        output_scale_factor: float = np.sqrt(2.0),
+        add_downsample: bool = True,
+        downsample_padding: int = 1,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
-        self.resnets = nn.ModuleList([])
+        self.resnets = nn.LayerList([])
 
         for i in range(num_layers):
             in_channels = in_channels if i == 0 else out_channels
@@ -1187,6 +1243,7 @@ class SkipDownBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
 
@@ -1205,9 +1262,10 @@ class SkipDownBlock2D(nn.Module):
                 use_in_shortcut=True,
                 down=True,
                 kernel="fir",
+                pre_temb_non_linearity=resnet_pre_temb_non_linearity,
             )
-            self.downsamplers = nn.ModuleList([FirDownsample2D(out_channels, out_channels=out_channels)])
-            self.skip_conv = nn.Conv2d(3, out_channels, kernel_size=(1, 1), stride=(1, 1))
+            self.downsamplers = nn.LayerList([FirDownsample2D(out_channels, out_channels=out_channels)])
+            self.skip_conv = nn.Conv2D(3, out_channels, kernel_size=(1, 1), stride=(1, 1))
         else:
             self.resnet_down = None
             self.downsamplers = None
@@ -1232,7 +1290,7 @@ class SkipDownBlock2D(nn.Module):
         return hidden_states, output_states, skip_sample
 
 
-class ResnetDownsampleBlock2D(nn.Module):
+class ResnetDownsampleBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -1245,8 +1303,9 @@ class ResnetDownsampleBlock2D(nn.Module):
         resnet_act_fn: str = "swish",
         resnet_groups: int = 32,
         resnet_pre_norm: bool = True,
-        output_scale_factor=1.0,
-        add_downsample=True,
+        output_scale_factor: float = 1.0,
+        add_downsample: bool = True,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
         resnets = []
@@ -1265,13 +1324,14 @@ class ResnetDownsampleBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
 
-        self.resnets = nn.ModuleList(resnets)
+        self.resnets = nn.LayerList(resnets)
 
         if add_downsample:
-            self.downsamplers = nn.ModuleList(
+            self.downsamplers = nn.LayerList(
                 [
                     ResnetBlock2D(
                         in_channels=out_channels,
@@ -1285,6 +1345,7 @@ class ResnetDownsampleBlock2D(nn.Module):
                         output_scale_factor=output_scale_factor,
                         pre_norm=resnet_pre_norm,
                         down=True,
+                        pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                     )
                 ]
             )
@@ -1305,7 +1366,7 @@ class ResnetDownsampleBlock2D(nn.Module):
 
                     return custom_forward
 
-                hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(resnet), hidden_states, temb)
+                hidden_states = recompute(create_custom_forward(resnet), hidden_states, temb)
             else:
                 hidden_states = resnet(hidden_states, temb)
 
@@ -1320,7 +1381,7 @@ class ResnetDownsampleBlock2D(nn.Module):
         return hidden_states, output_states
 
 
-class SimpleCrossAttnDownBlock2D(nn.Module):
+class SimpleCrossAttnDownBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -1333,10 +1394,11 @@ class SimpleCrossAttnDownBlock2D(nn.Module):
         resnet_act_fn: str = "swish",
         resnet_groups: int = 32,
         resnet_pre_norm: bool = True,
-        attn_num_head_channels=1,
-        cross_attention_dim=1280,
-        output_scale_factor=1.0,
-        add_downsample=True,
+        attn_num_head_channels: int = 1,
+        cross_attention_dim: int = 1280,
+        output_scale_factor: float = 1.0,
+        add_downsample: bool = True,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
 
@@ -1362,6 +1424,7 @@ class SimpleCrossAttnDownBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
             attentions.append(
@@ -1377,11 +1440,11 @@ class SimpleCrossAttnDownBlock2D(nn.Module):
                     processor=CrossAttnAddedKVProcessor(),
                 )
             )
-        self.attentions = nn.ModuleList(attentions)
-        self.resnets = nn.ModuleList(resnets)
+        self.attentions = nn.LayerList(attentions)
+        self.resnets = nn.LayerList(resnets)
 
         if add_downsample:
-            self.downsamplers = nn.ModuleList(
+            self.downsamplers = nn.LayerList(
                 [
                     ResnetBlock2D(
                         in_channels=out_channels,
@@ -1395,6 +1458,7 @@ class SimpleCrossAttnDownBlock2D(nn.Module):
                         output_scale_factor=output_scale_factor,
                         pre_norm=resnet_pre_norm,
                         down=True,
+                        pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                     )
                 ]
             )
@@ -1432,7 +1496,7 @@ class SimpleCrossAttnDownBlock2D(nn.Module):
         return hidden_states, output_states
 
 
-class KDownBlock2D(nn.Module):
+class KDownBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -1443,7 +1507,8 @@ class KDownBlock2D(nn.Module):
         resnet_eps: float = 1e-5,
         resnet_act_fn: str = "gelu",
         resnet_group_size: int = 32,
-        add_downsample=False,
+        add_downsample: bool = False,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
         resnets = []
@@ -1465,14 +1530,15 @@ class KDownBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     time_embedding_norm="ada_group",
                     conv_shortcut_bias=False,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
 
-        self.resnets = nn.ModuleList(resnets)
+        self.resnets = nn.LayerList(resnets)
 
         if add_downsample:
             # YiYi's comments- might be able to use FirDownsample2D, look into details later
-            self.downsamplers = nn.ModuleList([KDownsample2D()])
+            self.downsamplers = nn.LayerList([KDownsample2D()])
         else:
             self.downsamplers = None
 
@@ -1490,7 +1556,7 @@ class KDownBlock2D(nn.Module):
 
                     return custom_forward
 
-                hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(resnet), hidden_states, temb)
+                hidden_states = recompute(create_custom_forward(resnet), hidden_states, temb)
             else:
                 hidden_states = resnet(hidden_states, temb)
 
@@ -1503,7 +1569,7 @@ class KDownBlock2D(nn.Module):
         return hidden_states, output_states
 
 
-class KCrossAttnDownBlock2D(nn.Module):
+class KCrossAttnDownBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -1518,6 +1584,7 @@ class KCrossAttnDownBlock2D(nn.Module):
         add_self_attention: bool = False,
         resnet_eps: float = 1e-5,
         resnet_act_fn: str = "gelu",
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
         resnets = []
@@ -1542,6 +1609,7 @@ class KCrossAttnDownBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     time_embedding_norm="ada_group",
                     conv_shortcut_bias=False,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
             attentions.append(
@@ -1558,11 +1626,11 @@ class KCrossAttnDownBlock2D(nn.Module):
                 )
             )
 
-        self.resnets = nn.ModuleList(resnets)
-        self.attentions = nn.ModuleList(attentions)
+        self.resnets = nn.LayerList(resnets)
+        self.attentions = nn.LayerList(attentions)
 
         if add_downsample:
-            self.downsamplers = nn.ModuleList([KDownsample2D()])
+            self.downsamplers = nn.LayerList([KDownsample2D()])
         else:
             self.downsamplers = None
 
@@ -1585,8 +1653,8 @@ class KCrossAttnDownBlock2D(nn.Module):
 
                     return custom_forward
 
-                hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(resnet), hidden_states, temb)
-                hidden_states = torch.utils.checkpoint.checkpoint(
+                hidden_states = recompute(create_custom_forward(resnet), hidden_states, temb)
+                hidden_states = recompute(
                     create_custom_forward(attn, return_dict=False),
                     hidden_states,
                     encoder_hidden_states,
@@ -1615,7 +1683,7 @@ class KCrossAttnDownBlock2D(nn.Module):
         return hidden_states, output_states
 
 
-class AttnUpBlock2D(nn.Module):
+class AttnUpBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -1629,9 +1697,10 @@ class AttnUpBlock2D(nn.Module):
         resnet_act_fn: str = "swish",
         resnet_groups: int = 32,
         resnet_pre_norm: bool = True,
-        attn_num_head_channels=1,
-        output_scale_factor=1.0,
-        add_upsample=True,
+        attn_num_head_channels: int = 1,
+        output_scale_factor: float = 1.0,
+        add_upsample: bool = True,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
         resnets = []
@@ -1653,6 +1722,7 @@ class AttnUpBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
             attentions.append(
@@ -1665,11 +1735,11 @@ class AttnUpBlock2D(nn.Module):
                 )
             )
 
-        self.attentions = nn.ModuleList(attentions)
-        self.resnets = nn.ModuleList(resnets)
+        self.attentions = nn.LayerList(attentions)
+        self.resnets = nn.LayerList(resnets)
 
         if add_upsample:
-            self.upsamplers = nn.ModuleList([Upsample2D(out_channels, use_conv=True, out_channels=out_channels)])
+            self.upsamplers = nn.LayerList([Upsample2D(out_channels, use_conv=True, out_channels=out_channels)])
         else:
             self.upsamplers = None
 
@@ -1678,7 +1748,7 @@ class AttnUpBlock2D(nn.Module):
             # pop res hidden states
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
-            hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+            hidden_states = paddle.concat([hidden_states, res_hidden_states], axis=1)
 
             hidden_states = resnet(hidden_states, temb)
             hidden_states = attn(hidden_states)
@@ -1690,7 +1760,7 @@ class AttnUpBlock2D(nn.Module):
         return hidden_states
 
 
-class CrossAttnUpBlock2D(nn.Module):
+class CrossAttnUpBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -1704,14 +1774,15 @@ class CrossAttnUpBlock2D(nn.Module):
         resnet_act_fn: str = "swish",
         resnet_groups: int = 32,
         resnet_pre_norm: bool = True,
-        attn_num_head_channels=1,
-        cross_attention_dim=1280,
-        output_scale_factor=1.0,
-        add_upsample=True,
-        dual_cross_attention=False,
-        use_linear_projection=False,
-        only_cross_attention=False,
-        upcast_attention=False,
+        attn_num_head_channels: int = 1,
+        cross_attention_dim: int = 1280,
+        output_scale_factor: float = 1.0,
+        add_upsample: bool = True,
+        dual_cross_attention: bool = False,
+        use_linear_projection: bool = False,
+        only_cross_attention: bool = False,
+        upcast_attention: bool = False,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
         resnets = []
@@ -1736,6 +1807,7 @@ class CrossAttnUpBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
             if not dual_cross_attention:
@@ -1763,11 +1835,11 @@ class CrossAttnUpBlock2D(nn.Module):
                         norm_num_groups=resnet_groups,
                     )
                 )
-        self.attentions = nn.ModuleList(attentions)
-        self.resnets = nn.ModuleList(resnets)
+        self.attentions = nn.LayerList(attentions)
+        self.resnets = nn.LayerList(resnets)
 
         if add_upsample:
-            self.upsamplers = nn.ModuleList([Upsample2D(out_channels, use_conv=True, out_channels=out_channels)])
+            self.upsamplers = nn.LayerList([Upsample2D(out_channels, use_conv=True, out_channels=out_channels)])
         else:
             self.upsamplers = None
 
@@ -1788,26 +1860,26 @@ class CrossAttnUpBlock2D(nn.Module):
             # pop res hidden states
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
-            hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+            hidden_states = paddle.concat([hidden_states, res_hidden_states], axis=1)
 
             if self.training and self.gradient_checkpointing:
 
                 def create_custom_forward(module, return_dict=None):
                     def custom_forward(*inputs):
                         if return_dict is not None:
-                            return module(*inputs, return_dict=return_dict)
+                            return module(*inputs, return_dict=return_dict)[0]  # move [0]
                         else:
                             return module(*inputs)
 
                     return custom_forward
 
-                hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(resnet), hidden_states, temb)
-                hidden_states = torch.utils.checkpoint.checkpoint(
+                hidden_states = recompute(create_custom_forward(resnet), hidden_states, temb)
+                hidden_states = recompute(
                     create_custom_forward(attn, return_dict=False),
                     hidden_states,
                     encoder_hidden_states,
                     cross_attention_kwargs,
-                )[0]
+                )  # [0]
             else:
                 hidden_states = resnet(hidden_states, temb)
                 hidden_states = attn(
@@ -1823,7 +1895,7 @@ class CrossAttnUpBlock2D(nn.Module):
         return hidden_states
 
 
-class UpBlock2D(nn.Module):
+class UpBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -1837,8 +1909,9 @@ class UpBlock2D(nn.Module):
         resnet_act_fn: str = "swish",
         resnet_groups: int = 32,
         resnet_pre_norm: bool = True,
-        output_scale_factor=1.0,
-        add_upsample=True,
+        output_scale_factor: float = 1.0,
+        add_upsample: bool = True,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
         resnets = []
@@ -1859,13 +1932,14 @@ class UpBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
 
-        self.resnets = nn.ModuleList(resnets)
+        self.resnets = nn.LayerList(resnets)
 
         if add_upsample:
-            self.upsamplers = nn.ModuleList([Upsample2D(out_channels, use_conv=True, out_channels=out_channels)])
+            self.upsamplers = nn.LayerList([Upsample2D(out_channels, use_conv=True, out_channels=out_channels)])
         else:
             self.upsamplers = None
 
@@ -1876,7 +1950,7 @@ class UpBlock2D(nn.Module):
             # pop res hidden states
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
-            hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+            hidden_states = paddle.concat([hidden_states, res_hidden_states], axis=1)
 
             if self.training and self.gradient_checkpointing:
 
@@ -1886,7 +1960,7 @@ class UpBlock2D(nn.Module):
 
                     return custom_forward
 
-                hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(resnet), hidden_states, temb)
+                hidden_states = recompute(create_custom_forward(resnet), hidden_states, temb)
             else:
                 hidden_states = resnet(hidden_states, temb)
 
@@ -1897,7 +1971,7 @@ class UpBlock2D(nn.Module):
         return hidden_states
 
 
-class UpDecoderBlock2D(nn.Module):
+class UpDecoderBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -1909,8 +1983,9 @@ class UpDecoderBlock2D(nn.Module):
         resnet_act_fn: str = "swish",
         resnet_groups: int = 32,
         resnet_pre_norm: bool = True,
-        output_scale_factor=1.0,
-        add_upsample=True,
+        output_scale_factor: float = 1.0,
+        add_upsample: bool = True,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
         resnets = []
@@ -1930,13 +2005,14 @@ class UpDecoderBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
 
-        self.resnets = nn.ModuleList(resnets)
+        self.resnets = nn.LayerList(resnets)
 
         if add_upsample:
-            self.upsamplers = nn.ModuleList([Upsample2D(out_channels, use_conv=True, out_channels=out_channels)])
+            self.upsamplers = nn.LayerList([Upsample2D(out_channels, use_conv=True, out_channels=out_channels)])
         else:
             self.upsamplers = None
 
@@ -1951,7 +2027,7 @@ class UpDecoderBlock2D(nn.Module):
         return hidden_states
 
 
-class AttnUpDecoderBlock2D(nn.Module):
+class AttnUpDecoderBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -1963,9 +2039,10 @@ class AttnUpDecoderBlock2D(nn.Module):
         resnet_act_fn: str = "swish",
         resnet_groups: int = 32,
         resnet_pre_norm: bool = True,
-        attn_num_head_channels=1,
-        output_scale_factor=1.0,
-        add_upsample=True,
+        attn_num_head_channels: int = 1,
+        output_scale_factor: float = 1.0,
+        add_upsample: bool = True,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
         resnets = []
@@ -1986,6 +2063,7 @@ class AttnUpDecoderBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
             attentions.append(
@@ -1998,11 +2076,11 @@ class AttnUpDecoderBlock2D(nn.Module):
                 )
             )
 
-        self.attentions = nn.ModuleList(attentions)
-        self.resnets = nn.ModuleList(resnets)
+        self.attentions = nn.LayerList(attentions)
+        self.resnets = nn.LayerList(resnets)
 
         if add_upsample:
-            self.upsamplers = nn.ModuleList([Upsample2D(out_channels, use_conv=True, out_channels=out_channels)])
+            self.upsamplers = nn.LayerList([Upsample2D(out_channels, use_conv=True, out_channels=out_channels)])
         else:
             self.upsamplers = None
 
@@ -2018,7 +2096,7 @@ class AttnUpDecoderBlock2D(nn.Module):
         return hidden_states
 
 
-class AttnSkipUpBlock2D(nn.Module):
+class AttnSkipUpBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -2031,14 +2109,15 @@ class AttnSkipUpBlock2D(nn.Module):
         resnet_time_scale_shift: str = "default",
         resnet_act_fn: str = "swish",
         resnet_pre_norm: bool = True,
-        attn_num_head_channels=1,
-        output_scale_factor=np.sqrt(2.0),
-        upsample_padding=1,
-        add_upsample=True,
+        attn_num_head_channels: int = 1,
+        output_scale_factor: float = np.sqrt(2.0),
+        upsample_padding: int = 1,
+        add_upsample: bool = True,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
-        self.attentions = nn.ModuleList([])
-        self.resnets = nn.ModuleList([])
+        self.attentions = nn.LayerList([])
+        self.resnets = nn.LayerList([])
 
         for i in range(num_layers):
             res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
@@ -2057,6 +2136,7 @@ class AttnSkipUpBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
 
@@ -2086,12 +2166,13 @@ class AttnSkipUpBlock2D(nn.Module):
                 use_in_shortcut=True,
                 up=True,
                 kernel="fir",
+                pre_temb_non_linearity=resnet_pre_temb_non_linearity,
             )
-            self.skip_conv = nn.Conv2d(out_channels, 3, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
-            self.skip_norm = torch.nn.GroupNorm(
-                num_groups=min(out_channels // 4, 32), num_channels=out_channels, eps=resnet_eps, affine=True
+            self.skip_conv = nn.Conv2D(out_channels, 3, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+            self.skip_norm = nn.GroupNorm(
+                num_groups=min(out_channels // 4, 32), num_channels=out_channels, epsilon=resnet_eps
             )
-            self.act = nn.SiLU()
+            self.act = nn.Silu()
         else:
             self.resnet_up = None
             self.skip_conv = None
@@ -2103,7 +2184,7 @@ class AttnSkipUpBlock2D(nn.Module):
             # pop res hidden states
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
-            hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+            hidden_states = paddle.concat([hidden_states, res_hidden_states], axis=1)
 
             hidden_states = resnet(hidden_states, temb)
 
@@ -2126,7 +2207,7 @@ class AttnSkipUpBlock2D(nn.Module):
         return hidden_states, skip_sample
 
 
-class SkipUpBlock2D(nn.Module):
+class SkipUpBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -2139,12 +2220,13 @@ class SkipUpBlock2D(nn.Module):
         resnet_time_scale_shift: str = "default",
         resnet_act_fn: str = "swish",
         resnet_pre_norm: bool = True,
-        output_scale_factor=np.sqrt(2.0),
-        add_upsample=True,
-        upsample_padding=1,
+        output_scale_factor: float = np.sqrt(2.0),
+        add_upsample: bool = True,
+        upsample_padding: int = 1,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
-        self.resnets = nn.ModuleList([])
+        self.resnets = nn.LayerList([])
 
         for i in range(num_layers):
             res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
@@ -2163,6 +2245,7 @@ class SkipUpBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
 
@@ -2183,12 +2266,13 @@ class SkipUpBlock2D(nn.Module):
                 use_in_shortcut=True,
                 up=True,
                 kernel="fir",
+                pre_temb_non_linearity=resnet_pre_temb_non_linearity,
             )
-            self.skip_conv = nn.Conv2d(out_channels, 3, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
-            self.skip_norm = torch.nn.GroupNorm(
-                num_groups=min(out_channels // 4, 32), num_channels=out_channels, eps=resnet_eps, affine=True
+            self.skip_conv = nn.Conv2D(out_channels, 3, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+            self.skip_norm = nn.GroupNorm(
+                num_groups=min(out_channels // 4, 32), num_channels=out_channels, epsilon=resnet_eps
             )
-            self.act = nn.SiLU()
+            self.act = nn.Silu()
         else:
             self.resnet_up = None
             self.skip_conv = None
@@ -2200,7 +2284,7 @@ class SkipUpBlock2D(nn.Module):
             # pop res hidden states
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
-            hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+            hidden_states = paddle.concat([hidden_states, res_hidden_states], axis=1)
 
             hidden_states = resnet(hidden_states, temb)
 
@@ -2221,7 +2305,7 @@ class SkipUpBlock2D(nn.Module):
         return hidden_states, skip_sample
 
 
-class ResnetUpsampleBlock2D(nn.Module):
+class ResnetUpsampleBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -2235,8 +2319,9 @@ class ResnetUpsampleBlock2D(nn.Module):
         resnet_act_fn: str = "swish",
         resnet_groups: int = 32,
         resnet_pre_norm: bool = True,
-        output_scale_factor=1.0,
-        add_upsample=True,
+        output_scale_factor: float = 1.0,
+        add_upsample: bool = True,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
         resnets = []
@@ -2257,13 +2342,14 @@ class ResnetUpsampleBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
 
-        self.resnets = nn.ModuleList(resnets)
+        self.resnets = nn.LayerList(resnets)
 
         if add_upsample:
-            self.upsamplers = nn.ModuleList(
+            self.upsamplers = nn.LayerList(
                 [
                     ResnetBlock2D(
                         in_channels=out_channels,
@@ -2277,6 +2363,7 @@ class ResnetUpsampleBlock2D(nn.Module):
                         output_scale_factor=output_scale_factor,
                         pre_norm=resnet_pre_norm,
                         up=True,
+                        pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                     )
                 ]
             )
@@ -2290,7 +2377,7 @@ class ResnetUpsampleBlock2D(nn.Module):
             # pop res hidden states
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
-            hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+            hidden_states = paddle.concat([hidden_states, res_hidden_states], axis=1)
 
             if self.training and self.gradient_checkpointing:
 
@@ -2300,7 +2387,7 @@ class ResnetUpsampleBlock2D(nn.Module):
 
                     return custom_forward
 
-                hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(resnet), hidden_states, temb)
+                hidden_states = recompute(create_custom_forward(resnet), hidden_states, temb)
             else:
                 hidden_states = resnet(hidden_states, temb)
 
@@ -2311,7 +2398,7 @@ class ResnetUpsampleBlock2D(nn.Module):
         return hidden_states
 
 
-class SimpleCrossAttnUpBlock2D(nn.Module):
+class SimpleCrossAttnUpBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -2325,10 +2412,11 @@ class SimpleCrossAttnUpBlock2D(nn.Module):
         resnet_act_fn: str = "swish",
         resnet_groups: int = 32,
         resnet_pre_norm: bool = True,
-        attn_num_head_channels=1,
-        cross_attention_dim=1280,
-        output_scale_factor=1.0,
-        add_upsample=True,
+        attn_num_head_channels: int = 1,
+        cross_attention_dim: int = 1280,
+        output_scale_factor: float = 1.0,
+        add_upsample: bool = True,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
         resnets = []
@@ -2355,6 +2443,7 @@ class SimpleCrossAttnUpBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
             attentions.append(
@@ -2370,11 +2459,11 @@ class SimpleCrossAttnUpBlock2D(nn.Module):
                     processor=CrossAttnAddedKVProcessor(),
                 )
             )
-        self.attentions = nn.ModuleList(attentions)
-        self.resnets = nn.ModuleList(resnets)
+        self.attentions = nn.LayerList(attentions)
+        self.resnets = nn.LayerList(resnets)
 
         if add_upsample:
-            self.upsamplers = nn.ModuleList(
+            self.upsamplers = nn.LayerList(
                 [
                     ResnetBlock2D(
                         in_channels=out_channels,
@@ -2388,6 +2477,7 @@ class SimpleCrossAttnUpBlock2D(nn.Module):
                         output_scale_factor=output_scale_factor,
                         pre_norm=resnet_pre_norm,
                         up=True,
+                        pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                     )
                 ]
             )
@@ -2412,7 +2502,7 @@ class SimpleCrossAttnUpBlock2D(nn.Module):
             # pop res hidden states
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
-            hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+            hidden_states = paddle.concat([hidden_states, res_hidden_states], axis=1)
 
             hidden_states = resnet(hidden_states, temb)
 
@@ -2431,7 +2521,7 @@ class SimpleCrossAttnUpBlock2D(nn.Module):
         return hidden_states
 
 
-class KUpBlock2D(nn.Module):
+class KUpBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -2442,7 +2532,8 @@ class KUpBlock2D(nn.Module):
         resnet_eps: float = 1e-5,
         resnet_act_fn: str = "gelu",
         resnet_group_size: Optional[int] = 32,
-        add_upsample=True,
+        add_upsample: bool = True,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
         resnets = []
@@ -2467,13 +2558,14 @@ class KUpBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     time_embedding_norm="ada_group",
                     conv_shortcut_bias=False,
+                    pre_norm=resnet_pre_temb_non_linearity,
                 )
             )
 
-        self.resnets = nn.ModuleList(resnets)
+        self.resnets = nn.LayerList(resnets)
 
         if add_upsample:
-            self.upsamplers = nn.ModuleList([KUpsample2D()])
+            self.upsamplers = nn.LayerList([KUpsample2D()])
         else:
             self.upsamplers = None
 
@@ -2482,7 +2574,7 @@ class KUpBlock2D(nn.Module):
     def forward(self, hidden_states, res_hidden_states_tuple, temb=None, upsample_size=None):
         res_hidden_states_tuple = res_hidden_states_tuple[-1]
         if res_hidden_states_tuple is not None:
-            hidden_states = torch.cat([hidden_states, res_hidden_states_tuple], dim=1)
+            hidden_states = paddle.concat([hidden_states, res_hidden_states_tuple], axis=1)
 
         for resnet in self.resnets:
             if self.training and self.gradient_checkpointing:
@@ -2493,7 +2585,7 @@ class KUpBlock2D(nn.Module):
 
                     return custom_forward
 
-                hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(resnet), hidden_states, temb)
+                hidden_states = recompute(create_custom_forward(resnet), hidden_states, temb)
             else:
                 hidden_states = resnet(hidden_states, temb)
 
@@ -2504,7 +2596,7 @@ class KUpBlock2D(nn.Module):
         return hidden_states
 
 
-class KCrossAttnUpBlock2D(nn.Module):
+class KCrossAttnUpBlock2D(nn.Layer):
     def __init__(
         self,
         in_channels: int,
@@ -2519,6 +2611,7 @@ class KCrossAttnUpBlock2D(nn.Module):
         cross_attention_dim: int = 768,
         add_upsample: bool = True,
         upcast_attention: bool = False,
+        resnet_pre_temb_non_linearity: bool = False,
     ):
         super().__init__()
         resnets = []
@@ -2560,6 +2653,7 @@ class KCrossAttnUpBlock2D(nn.Module):
                     non_linearity=resnet_act_fn,
                     time_embedding_norm="ada_group",
                     conv_shortcut_bias=False,
+                    pre_temb_non_linearity=resnet_pre_temb_non_linearity,
                 )
             )
             attentions.append(
@@ -2578,11 +2672,11 @@ class KCrossAttnUpBlock2D(nn.Module):
                 )
             )
 
-        self.resnets = nn.ModuleList(resnets)
-        self.attentions = nn.ModuleList(attentions)
+        self.resnets = nn.LayerList(resnets)
+        self.attentions = nn.LayerList(attentions)
 
         if add_upsample:
-            self.upsamplers = nn.ModuleList([KUpsample2D()])
+            self.upsamplers = nn.LayerList([KUpsample2D()])
         else:
             self.upsamplers = None
 
@@ -2600,7 +2694,7 @@ class KCrossAttnUpBlock2D(nn.Module):
     ):
         res_hidden_states_tuple = res_hidden_states_tuple[-1]
         if res_hidden_states_tuple is not None:
-            hidden_states = torch.cat([hidden_states, res_hidden_states_tuple], dim=1)
+            hidden_states = paddle.concat([hidden_states, res_hidden_states_tuple], axis=1)
 
         for resnet, attn in zip(self.resnets, self.attentions):
             if self.training and self.gradient_checkpointing:
@@ -2608,20 +2702,20 @@ class KCrossAttnUpBlock2D(nn.Module):
                 def create_custom_forward(module, return_dict=None):
                     def custom_forward(*inputs):
                         if return_dict is not None:
-                            return module(*inputs, return_dict=return_dict)
+                            return module(*inputs, return_dict=return_dict)[0]  # move [0]
                         else:
                             return module(*inputs)
 
                     return custom_forward
 
-                hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(resnet), hidden_states, temb)
-                hidden_states = torch.utils.checkpoint.checkpoint(
+                hidden_states = recompute(create_custom_forward(resnet), hidden_states, temb)
+                hidden_states = recompute(
                     create_custom_forward(attn, return_dict=False),
                     hidden_states,
                     encoder_hidden_states,
                     attention_mask,
                     cross_attention_kwargs,
-                )[0]
+                )  # [0]
             else:
                 hidden_states = resnet(hidden_states, temb)
                 hidden_states = attn(
@@ -2640,7 +2734,7 @@ class KCrossAttnUpBlock2D(nn.Module):
 
 
 # can potentially later be renamed to `No-feed-forward` attention
-class KAttentionBlock(nn.Module):
+class KAttentionBlock(nn.Layer):
     r"""
     A basic Transformer block.
 
@@ -2701,10 +2795,10 @@ class KAttentionBlock(nn.Module):
         )
 
     def _to_3d(self, hidden_states, height, weight):
-        return hidden_states.permute(0, 2, 3, 1).reshape(hidden_states.shape[0], height * weight, -1)
+        return hidden_states.transpose([0, 2, 3, 1]).reshape([hidden_states.shape[0], height * weight, -1])
 
     def _to_4d(self, hidden_states, height, weight):
-        return hidden_states.permute(0, 2, 1).reshape(hidden_states.shape[0], -1, height, weight)
+        return hidden_states.transpose([0, 2, 1]).reshape([hidden_states.shape[0], -1, height, weight])
 
     def forward(
         self,

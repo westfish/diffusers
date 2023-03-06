@@ -13,25 +13,23 @@
 # limitations under the License.
 from typing import Callable, Optional, Union
 
-import torch
-import torch.nn.functional as F
-from torch import nn
+import paddle
+import paddle.nn as nn
+import paddle.nn.functional as F
 
-from ..utils import deprecate, logging
-from ..utils.import_utils import is_xformers_available
-
+from ..initializer import normal_, zeros_
+from ..utils import deprecate, is_cutlass_fused_multi_head_attention_available, logging
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
-if is_xformers_available():
-    import xformers
-    import xformers.ops
+if is_cutlass_fused_multi_head_attention_available():
+    from paddle.incubate.nn.functional import cutlass_fused_multi_head_attention
 else:
-    xformers = None
+    cutlass_fused_multi_head_attention = None
 
 
-class CrossAttention(nn.Module):
+class CrossAttention(nn.Layer):
     r"""
     A cross attention layer.
 
@@ -71,6 +69,7 @@ class CrossAttention(nn.Module):
         self.scale = dim_head**-0.5
 
         self.heads = heads
+        self.head_dim = dim_head
         # for slice_size > 0 the attention score computation
         # is split across the batch axis to save memory
         # You can set slice_size with `set_attention_slice`
@@ -79,30 +78,33 @@ class CrossAttention(nn.Module):
         self.added_kv_proj_dim = added_kv_proj_dim
 
         if norm_num_groups is not None:
-            self.group_norm = nn.GroupNorm(num_channels=inner_dim, num_groups=norm_num_groups, eps=1e-5, affine=True)
+            self.group_norm = nn.GroupNorm(num_channels=inner_dim, num_groups=norm_num_groups, epsilon=1e-5)
         else:
             self.group_norm = None
 
         if cross_attention_norm:
             self.norm_cross = nn.LayerNorm(cross_attention_dim)
 
-        self.to_q = nn.Linear(query_dim, inner_dim, bias=bias)
-        self.to_k = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
-        self.to_v = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
+        self.to_q = nn.Linear(query_dim, inner_dim, bias_attr=bias)
+        self.to_k = nn.Linear(cross_attention_dim, inner_dim, bias_attr=bias)
+        self.to_v = nn.Linear(cross_attention_dim, inner_dim, bias_attr=bias)
 
         if self.added_kv_proj_dim is not None:
             self.add_k_proj = nn.Linear(added_kv_proj_dim, cross_attention_dim)
             self.add_v_proj = nn.Linear(added_kv_proj_dim, cross_attention_dim)
 
-        self.to_out = nn.ModuleList([])
+        self.to_out = nn.LayerList([])
         self.to_out.append(nn.Linear(inner_dim, query_dim))
         self.to_out.append(nn.Dropout(dropout))
 
         # set attention processor
-        # We use the AttnProcessor2_0 by default when torch2.x is used which uses
-        # torch.nn.functional.scaled_dot_product_attention for native Flash/memory_efficient_attention
+        # We use the AttnProcessor2_5 by default when paddle 2.5 is used which uses
+        # paddle.incubate.nn.functional.cutlass_fused_multi_head_attention for native Flash/memory_efficient_attention
         if processor is None:
-            processor = AttnProcessor2_0() if hasattr(F, "scaled_dot_product_attention") else CrossAttnProcessor()
+            processor = CrossAttnProcessor()
+            # processor = (
+            #     AttnProcessor2_5() if is_cutlass_fused_multi_head_attention_available() else CrossAttnProcessor()
+            # )
         self.set_processor(processor)
 
     def set_use_memory_efficient_attention_xformers(
@@ -121,26 +123,17 @@ class CrossAttention(nn.Module):
                     "Memory efficient attention with `xformers` is currently not supported when"
                     " `self.added_kv_proj_dim` is defined."
                 )
-            elif not is_xformers_available():
-                raise ModuleNotFoundError(
-                    (
-                        "Refer to https://github.com/facebookresearch/xformers for more information on how to install"
-                        " xformers"
-                    ),
-                    name="xformers",
-                )
-            elif not torch.cuda.is_available():
-                raise ValueError(
-                    "torch.cuda.is_available() should be True but is False. xformers' memory efficient attention is"
-                    " only available for GPU "
+            elif not is_cutlass_fused_multi_head_attention_available():
+                raise NotImplementedError(
+                    "requires the CUTLASS_FUSED_MULTI_HEAD_ATTENTIOPN but your PaddlePaddle donot have this. Checkout the instructions on the installation page: https://www.paddlepaddle.org.cn/install/quick and follow the ones that match your environment."
                 )
             else:
                 try:
-                    # Make sure we can run the memory efficient attention
-                    _ = xformers.ops.memory_efficient_attention(
-                        torch.randn((1, 2, 40), device="cuda"),
-                        torch.randn((1, 2, 40), device="cuda"),
-                        torch.randn((1, 2, 40), device="cuda"),
+                    # Make sure we can run the cutlass_fused_multi_head_attention
+                    _ = cutlass_fused_multi_head_attention(
+                        paddle.randn((1, 1, 2, 40)),
+                        paddle.randn((1, 1, 2, 40)),
+                        paddle.randn((1, 1, 2, 40)),
                     )
                 except Exception as e:
                     raise e
@@ -152,8 +145,7 @@ class CrossAttention(nn.Module):
                     rank=self.processor.rank,
                     attention_op=attention_op,
                 )
-                processor.load_state_dict(self.processor.state_dict())
-                processor.to(self.processor.to_q_lora.up.weight.device)
+                processor.load_dict(self.processor.state_dict())
             else:
                 processor = XFormersCrossAttnProcessor(attention_op=attention_op)
         else:
@@ -163,8 +155,7 @@ class CrossAttention(nn.Module):
                     cross_attention_dim=self.processor.cross_attention_dim,
                     rank=self.processor.rank,
                 )
-                processor.load_state_dict(self.processor.state_dict())
-                processor.to(self.processor.to_q_lora.up.weight.device)
+                processor.load_dict(self.processor.state_dict())
             else:
                 processor = CrossAttnProcessor()
 
@@ -186,15 +177,11 @@ class CrossAttention(nn.Module):
         self.set_processor(processor)
 
     def set_processor(self, processor: "AttnProcessor"):
-        # if current processor is in `self._modules` and if passed `processor` is not, we need to
-        # pop `processor` from `self._modules`
-        if (
-            hasattr(self, "processor")
-            and isinstance(self.processor, torch.nn.Module)
-            and not isinstance(processor, torch.nn.Module)
-        ):
+        # if current processor is in `self._sub_layers` and if passed `processor` is not, we need to
+        # pop `processor` from `self._sub_layers`
+        if hasattr(self, "processor") and isinstance(self.processor, nn.Layer) and not isinstance(processor, nn.Layer):
             logger.info(f"You are removing possibly trained weights of {self.processor} with {processor}")
-            self._modules.pop("processor")
+            self._sub_layers.pop("processor")
 
         self.processor = processor
 
@@ -210,52 +197,38 @@ class CrossAttention(nn.Module):
             **cross_attention_kwargs,
         )
 
-    def batch_to_head_dim(self, tensor):
-        head_size = self.heads
-        batch_size, seq_len, dim = tensor.shape
-        tensor = tensor.reshape(batch_size // head_size, head_size, seq_len, dim)
-        tensor = tensor.permute(0, 2, 1, 3).reshape(batch_size // head_size, seq_len, dim * head_size)
+    def batch_to_head_dim(self, tensor, transpose=True):
+        if transpose:
+            tensor = tensor.transpose([0, 2, 1, 3])
+        tensor = tensor.reshape([0, 0, tensor.shape[2] * tensor.shape[3]])
         return tensor
 
-    def head_to_batch_dim(self, tensor):
-        head_size = self.heads
-        batch_size, seq_len, dim = tensor.shape
-        tensor = tensor.reshape(batch_size, seq_len, head_size, dim // head_size)
-        tensor = tensor.permute(0, 2, 1, 3).reshape(batch_size * head_size, seq_len, dim // head_size)
+    def head_to_batch_dim(self, tensor, transpose=True):
+        tensor = tensor.reshape([0, 0, self.heads, self.head_dim])
+        if transpose:
+            tensor = tensor.transpose([0, 2, 1, 3])
         return tensor
 
     def get_attention_scores(self, query, key, attention_mask=None):
         dtype = query.dtype
         if self.upcast_attention:
-            query = query.float()
-            key = key.float()
+            query = query.cast("float32")
+            key = key.cast("float32")
 
-        if attention_mask is None:
-            baddbmm_input = torch.empty(
-                query.shape[0], query.shape[1], key.shape[1], dtype=query.dtype, device=query.device
-            )
-            beta = 0
-        else:
-            baddbmm_input = attention_mask
-            beta = 1
+        attention_scores = paddle.matmul(query, key, transpose_y=True) * self.scale
 
-        attention_scores = torch.baddbmm(
-            baddbmm_input,
-            query,
-            key.transpose(-1, -2),
-            beta=beta,
-            alpha=self.scale,
-        )
+        if attention_mask is not None:
+            attention_scores = attention_scores + attention_mask
 
         if self.upcast_softmax:
-            attention_scores = attention_scores.float()
+            attention_scores = attention_scores.cast("float32")
 
-        attention_probs = attention_scores.softmax(dim=-1)
-        attention_probs = attention_probs.to(dtype)
+        attention_probs = F.softmax(attention_scores, axis=-1)
+        attention_probs = attention_probs.cast(dtype)
 
         return attention_probs
 
-    def prepare_attention_mask(self, attention_mask, target_length, batch_size=None):
+    def prepare_attention_mask(self, attention_mask, target_length, batch_size=None, reshape4d=True):
         if batch_size is None:
             deprecate(
                 "batch_size=None",
@@ -268,23 +241,22 @@ class CrossAttention(nn.Module):
             )
             batch_size = 1
 
-        head_size = self.heads
+        num_heads = self.heads
         if attention_mask is None:
             return attention_mask
 
         if attention_mask.shape[-1] != target_length:
-            if attention_mask.device.type == "mps":
-                # HACK: MPS: Does not support padding by greater than dimension of input tensor.
-                # Instead, we can manually construct the padding tensor.
-                padding_shape = (attention_mask.shape[0], attention_mask.shape[1], target_length)
-                padding = torch.zeros(padding_shape, dtype=attention_mask.dtype, device=attention_mask.device)
-                attention_mask = torch.cat([attention_mask, padding], dim=2)
-            else:
-                attention_mask = F.pad(attention_mask, (0, target_length), value=0.0)
+            attention_mask = F.pad(attention_mask, (0, target_length), value=0.0, data_format="NCL")
 
-        if attention_mask.shape[0] < batch_size * head_size:
-            attention_mask = attention_mask.repeat_interleave(head_size, dim=0)
-        return attention_mask
+        if attention_mask.shape[0] < batch_size * num_heads:
+            # TODO repeat_interleave may not support float16
+            attention_mask = attention_mask.repeat_interleave(num_heads, axis=0)
+
+        if reshape4d:
+            # batch_size, num_heads, 1, seqlen
+            return attention_mask.reshape([batch_size, num_heads, -1, attention_mask.shape[-1]])
+        else:
+            return attention_mask
 
 
 class CrossAttnProcessor:
@@ -312,7 +284,7 @@ class CrossAttnProcessor:
         value = attn.head_to_batch_dim(value)
 
         attention_probs = attn.get_attention_scores(query, key, attention_mask)
-        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = paddle.matmul(attention_probs, value)
         hidden_states = attn.batch_to_head_dim(hidden_states)
 
         # linear proj
@@ -323,7 +295,7 @@ class CrossAttnProcessor:
         return hidden_states
 
 
-class LoRALinearLayer(nn.Module):
+class LoRALinearLayer(nn.Layer):
     def __init__(self, in_features, out_features, rank=4):
         super().__init__()
 
@@ -333,20 +305,20 @@ class LoRALinearLayer(nn.Module):
         self.down = nn.Linear(in_features, rank, bias=False)
         self.up = nn.Linear(rank, out_features, bias=False)
 
-        nn.init.normal_(self.down.weight, std=1 / rank)
-        nn.init.zeros_(self.up.weight)
+        normal_(self.down.weight, std=1 / rank)
+        zeros_(self.up.weight)
 
     def forward(self, hidden_states):
         orig_dtype = hidden_states.dtype
         dtype = self.down.weight.dtype
 
-        down_hidden_states = self.down(hidden_states.to(dtype))
+        down_hidden_states = self.down(hidden_states.cast(dtype))
         up_hidden_states = self.up(down_hidden_states)
 
-        return up_hidden_states.to(orig_dtype)
+        return up_hidden_states.cast(orig_dtype)
 
 
-class LoRACrossAttnProcessor(nn.Module):
+class LoRACrossAttnProcessor(nn.Layer):
     def __init__(self, hidden_size, cross_attention_dim=None, rank=4):
         super().__init__()
 
@@ -377,7 +349,7 @@ class LoRACrossAttnProcessor(nn.Module):
         value = attn.head_to_batch_dim(value)
 
         attention_probs = attn.get_attention_scores(query, key, attention_mask)
-        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = paddle.matmul(attention_probs, value)
         hidden_states = attn.batch_to_head_dim(hidden_states)
 
         # linear proj
@@ -391,13 +363,15 @@ class LoRACrossAttnProcessor(nn.Module):
 class CrossAttnAddedKVProcessor:
     def __call__(self, attn: CrossAttention, hidden_states, encoder_hidden_states=None, attention_mask=None):
         residual = hidden_states
-        hidden_states = hidden_states.view(hidden_states.shape[0], hidden_states.shape[1], -1).transpose(1, 2)
+        hidden_states = hidden_states.reshape([hidden_states.shape[0], hidden_states.shape[1], -1]).transpose(
+            [0, 2, 1]
+        )
         batch_size, sequence_length, _ = hidden_states.shape
-        encoder_hidden_states = encoder_hidden_states.transpose(1, 2)
+        encoder_hidden_states = encoder_hidden_states.transpose([0, 2, 1])
 
         attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
 
-        hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+        hidden_states = attn.group_norm(hidden_states.transpose([0, 2, 1])).transpose([0, 2, 1])
 
         query = attn.to_q(hidden_states)
         query = attn.head_to_batch_dim(query)
@@ -412,11 +386,11 @@ class CrossAttnAddedKVProcessor:
         encoder_hidden_states_key_proj = attn.head_to_batch_dim(encoder_hidden_states_key_proj)
         encoder_hidden_states_value_proj = attn.head_to_batch_dim(encoder_hidden_states_value_proj)
 
-        key = torch.cat([encoder_hidden_states_key_proj, key], dim=1)
-        value = torch.cat([encoder_hidden_states_value_proj, value], dim=1)
+        key = paddle.concat([encoder_hidden_states_key_proj, key], axis=2)
+        value = paddle.concat([encoder_hidden_states_value_proj, value], axis=2)
 
         attention_probs = attn.get_attention_scores(query, key, attention_mask)
-        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = paddle.matmul(attention_probs, value)
         hidden_states = attn.batch_to_head_dim(hidden_states)
 
         # linear proj
@@ -424,7 +398,7 @@ class CrossAttnAddedKVProcessor:
         # dropout
         hidden_states = attn.to_out[1](hidden_states)
 
-        hidden_states = hidden_states.transpose(-1, -2).reshape(residual.shape)
+        hidden_states = hidden_states.transpose([0, 2, 1]).reshape(residual.shape)
         hidden_states = hidden_states + residual
 
         return hidden_states
@@ -449,59 +423,14 @@ class XFormersCrossAttnProcessor:
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
 
-        query = attn.head_to_batch_dim(query).contiguous()
-        key = attn.head_to_batch_dim(key).contiguous()
-        value = attn.head_to_batch_dim(value).contiguous()
+        # if transpose = False, query's shape will be [batch_size, seq_len, num_head, head_dim]
+        query = attn.head_to_batch_dim(query, transpose=False)
+        key = attn.head_to_batch_dim(key, transpose=False)
+        value = attn.head_to_batch_dim(value, transpose=False)
 
-        hidden_states = xformers.ops.memory_efficient_attention(
-            query, key, value, attn_bias=attention_mask, op=self.attention_op
-        )
-        hidden_states = hidden_states.to(query.dtype)
-        hidden_states = attn.batch_to_head_dim(hidden_states)
-
-        # linear proj
-        hidden_states = attn.to_out[0](hidden_states)
-        # dropout
-        hidden_states = attn.to_out[1](hidden_states)
-        return hidden_states
-
-
-class AttnProcessor2_0:
-    def __init__(self):
-        if not hasattr(F, "scaled_dot_product_attention"):
-            raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
-
-    def __call__(self, attn: CrossAttention, hidden_states, encoder_hidden_states=None, attention_mask=None):
-        batch_size, sequence_length, inner_dim = hidden_states.shape
-
-        if attention_mask is not None:
-            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
-            # scaled_dot_product_attention expects attention_mask shape to be
-            # (batch, heads, source_length, target_length)
-            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
-
-        query = attn.to_q(hidden_states)
-
-        if encoder_hidden_states is None:
-            encoder_hidden_states = hidden_states
-        elif attn.cross_attention_norm:
-            encoder_hidden_states = attn.norm_cross(encoder_hidden_states)
-
-        key = attn.to_k(encoder_hidden_states)
-        value = attn.to_v(encoder_hidden_states)
-
-        head_dim = inner_dim // attn.heads
-        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-
-        # the output of sdp = (batch, num_heads, seq_len, head_dim)
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-        )
-
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
-        hidden_states = hidden_states.to(query.dtype)
+        hidden_states = cutlass_fused_multi_head_attention(query, key, value, attention_mask, attn.scale)
+        # hidden_states = hidden_states.cast(query.dtype)
+        hidden_states = attn.batch_to_head_dim(hidden_states, transpose=False)
 
         # linear proj
         hidden_states = attn.to_out[0](hidden_states)
@@ -510,7 +439,7 @@ class AttnProcessor2_0:
         return hidden_states
 
 
-class LoRAXFormersCrossAttnProcessor(nn.Module):
+class LoRAXFormersCrossAttnProcessor(nn.Layer):
     def __init__(self, hidden_size, cross_attention_dim, rank=4, attention_op: Optional[Callable] = None):
         super().__init__()
 
@@ -531,20 +460,18 @@ class LoRAXFormersCrossAttnProcessor(nn.Module):
         attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
 
         query = attn.to_q(hidden_states) + scale * self.to_q_lora(hidden_states)
-        query = attn.head_to_batch_dim(query).contiguous()
+        query = attn.head_to_batch_dim(query, transpose=False)
 
         encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
 
         key = attn.to_k(encoder_hidden_states) + scale * self.to_k_lora(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states) + scale * self.to_v_lora(encoder_hidden_states)
 
-        key = attn.head_to_batch_dim(key).contiguous()
-        value = attn.head_to_batch_dim(value).contiguous()
+        key = attn.head_to_batch_dim(key, transpose=False)
+        value = attn.head_to_batch_dim(value, transpose=False)
 
-        hidden_states = xformers.ops.memory_efficient_attention(
-            query, key, value, attn_bias=attention_mask, op=self.attention_op
-        )
-        hidden_states = attn.batch_to_head_dim(hidden_states)
+        hidden_states = cutlass_fused_multi_head_attention(query, key, value, attention_mask, attn.scale)
+        hidden_states = attn.batch_to_head_dim(hidden_states, transpose=False)
 
         # linear proj
         hidden_states = attn.to_out[0](hidden_states) + scale * self.to_out_lora(hidden_states)
@@ -561,10 +488,9 @@ class SlicedAttnProcessor:
     def __call__(self, attn: CrossAttention, hidden_states, encoder_hidden_states=None, attention_mask=None):
         batch_size, sequence_length, _ = hidden_states.shape
 
-        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size, reshape4d=False)
 
         query = attn.to_q(hidden_states)
-        dim = query.shape[-1]
         query = attn.head_to_batch_dim(query)
 
         if encoder_hidden_states is None:
@@ -577,10 +503,12 @@ class SlicedAttnProcessor:
         key = attn.head_to_batch_dim(key)
         value = attn.head_to_batch_dim(value)
 
+        query = query.flatten(0, 1)
+        key = key.flatten(0, 1)
+        value = value.flatten(0, 1)
+
         batch_size_attention = query.shape[0]
-        hidden_states = torch.zeros(
-            (batch_size_attention, sequence_length, dim // attn.heads), device=query.device, dtype=query.dtype
-        )
+        hidden_states = paddle.zeros((batch_size_attention, sequence_length, attn.head_dim), dtype=query.dtype)
 
         for i in range(hidden_states.shape[0] // self.slice_size):
             start_idx = i * self.slice_size
@@ -592,12 +520,14 @@ class SlicedAttnProcessor:
 
             attn_slice = attn.get_attention_scores(query_slice, key_slice, attn_mask_slice)
 
-            attn_slice = torch.bmm(attn_slice, value[start_idx:end_idx])
+            attn_slice = paddle.matmul(attn_slice, value[start_idx:end_idx])
 
             hidden_states[start_idx:end_idx] = attn_slice
 
-        hidden_states = attn.batch_to_head_dim(hidden_states)
+        # reshape back to [bs, num_heads, seqlen, head_dim]
+        hidden_states = hidden_states.reshape([-1, attn.heads, sequence_length, attn.head_dim])
 
+        hidden_states = attn.batch_to_head_dim(hidden_states)
         # linear proj
         hidden_states = attn.to_out[0](hidden_states)
         # dropout
@@ -612,17 +542,18 @@ class SlicedAttnAddedKVProcessor:
 
     def __call__(self, attn: "CrossAttention", hidden_states, encoder_hidden_states=None, attention_mask=None):
         residual = hidden_states
-        hidden_states = hidden_states.view(hidden_states.shape[0], hidden_states.shape[1], -1).transpose(1, 2)
-        encoder_hidden_states = encoder_hidden_states.transpose(1, 2)
+        hidden_states = hidden_states.reshape([hidden_states.shape[0], hidden_states.shape[1], -1]).transpose(
+            [0, 2, 1]
+        )
+        encoder_hidden_states = encoder_hidden_states.transpose([0, 2, 1])
 
         batch_size, sequence_length, _ = hidden_states.shape
 
-        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size, reshape4d=False)
 
-        hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+        hidden_states = attn.group_norm(hidden_states.transpose([0, 2, 1])).transpose([0, 2, 1])
 
         query = attn.to_q(hidden_states)
-        dim = query.shape[-1]
         query = attn.head_to_batch_dim(query)
 
         key = attn.to_k(hidden_states)
@@ -635,13 +566,16 @@ class SlicedAttnAddedKVProcessor:
         encoder_hidden_states_key_proj = attn.head_to_batch_dim(encoder_hidden_states_key_proj)
         encoder_hidden_states_value_proj = attn.head_to_batch_dim(encoder_hidden_states_value_proj)
 
-        key = torch.cat([encoder_hidden_states_key_proj, key], dim=1)
-        value = torch.cat([encoder_hidden_states_value_proj, value], dim=1)
+        key = paddle.concat([encoder_hidden_states_key_proj, key], axis=2)
+        value = paddle.concat([encoder_hidden_states_value_proj, value], axis=2)
+
+        # flatten
+        query = query.flatten(0, 1)
+        key = key.flatten(0, 1)
+        value = value.flatten(0, 1)
 
         batch_size_attention = query.shape[0]
-        hidden_states = torch.zeros(
-            (batch_size_attention, sequence_length, dim // attn.heads), device=query.device, dtype=query.dtype
-        )
+        hidden_states = paddle.zeros((batch_size_attention, sequence_length, attn.head_dim), dtype=query.dtype)
 
         for i in range(hidden_states.shape[0] // self.slice_size):
             start_idx = i * self.slice_size
@@ -653,9 +587,12 @@ class SlicedAttnAddedKVProcessor:
 
             attn_slice = attn.get_attention_scores(query_slice, key_slice, attn_mask_slice)
 
-            attn_slice = torch.bmm(attn_slice, value[start_idx:end_idx])
+            attn_slice = paddle.matmul(attn_slice, value[start_idx:end_idx])
 
             hidden_states[start_idx:end_idx] = attn_slice
+
+        # reshape back to [bs, num_heads, seqlen, head_dim]
+        hidden_states = hidden_states.reshape([-1, attn.heads, sequence_length, attn.head_dim])
 
         hidden_states = attn.batch_to_head_dim(hidden_states)
 
@@ -664,11 +601,13 @@ class SlicedAttnAddedKVProcessor:
         # dropout
         hidden_states = attn.to_out[1](hidden_states)
 
-        hidden_states = hidden_states.transpose(-1, -2).reshape(residual.shape)
+        hidden_states = hidden_states.transpose([0, 2, 1]).reshape(residual.shape)
         hidden_states = hidden_states + residual
 
         return hidden_states
 
+
+AttnProcessor2_5 = XFormersCrossAttnProcessor
 
 AttnProcessor = Union[
     CrossAttnProcessor,

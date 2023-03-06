@@ -15,8 +15,8 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-import torch
-import torch.nn as nn
+import paddle
+import paddle.nn as nn
 
 from ..utils import BaseOutput, randn_tensor
 from .unet_2d_blocks import UNetMidBlock2D, get_down_block, get_up_block
@@ -28,14 +28,14 @@ class DecoderOutput(BaseOutput):
     Output of decoding method.
 
     Args:
-        sample (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`):
+        sample (`paddle.Tensor` of shape `(batch_size, num_channels, height, width)`):
             Decoded output sample of the model. Output of the last layer of the model.
     """
 
-    sample: torch.FloatTensor
+    sample: paddle.Tensor
 
 
-class Encoder(nn.Module):
+class Encoder(nn.Layer):
     def __init__(
         self,
         in_channels=3,
@@ -50,10 +50,10 @@ class Encoder(nn.Module):
         super().__init__()
         self.layers_per_block = layers_per_block
 
-        self.conv_in = torch.nn.Conv2d(in_channels, block_out_channels[0], kernel_size=3, stride=1, padding=1)
+        self.conv_in = nn.Conv2D(in_channels, block_out_channels[0], kernel_size=3, stride=1, padding=1)
 
         self.mid_block = None
-        self.down_blocks = nn.ModuleList([])
+        self.down_blocks = nn.LayerList([])
 
         # down
         output_channel = block_out_channels[0]
@@ -90,11 +90,13 @@ class Encoder(nn.Module):
         )
 
         # out
-        self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[-1], num_groups=norm_num_groups, eps=1e-6)
-        self.conv_act = nn.SiLU()
+        self.conv_norm_out = nn.GroupNorm(
+            num_channels=block_out_channels[-1], num_groups=norm_num_groups, epsilon=1e-6
+        )
+        self.conv_act = nn.Silu()
 
         conv_out_channels = 2 * out_channels if double_z else out_channels
-        self.conv_out = nn.Conv2d(block_out_channels[-1], conv_out_channels, 3, padding=1)
+        self.conv_out = nn.Conv2D(block_out_channels[-1], conv_out_channels, 3, padding=1)
 
     def forward(self, x):
         sample = x
@@ -115,7 +117,7 @@ class Encoder(nn.Module):
         return sample
 
 
-class Decoder(nn.Module):
+class Decoder(nn.Layer):
     def __init__(
         self,
         in_channels=3,
@@ -129,10 +131,10 @@ class Decoder(nn.Module):
         super().__init__()
         self.layers_per_block = layers_per_block
 
-        self.conv_in = nn.Conv2d(in_channels, block_out_channels[-1], kernel_size=3, stride=1, padding=1)
+        self.conv_in = nn.Conv2D(in_channels, block_out_channels[-1], kernel_size=3, stride=1, padding=1)
 
         self.mid_block = None
-        self.up_blocks = nn.ModuleList([])
+        self.up_blocks = nn.LayerList([])
 
         # mid
         self.mid_block = UNetMidBlock2D(
@@ -172,9 +174,9 @@ class Decoder(nn.Module):
             prev_output_channel = output_channel
 
         # out
-        self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=1e-6)
-        self.conv_act = nn.SiLU()
-        self.conv_out = nn.Conv2d(block_out_channels[0], out_channels, 3, padding=1)
+        self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[0], num_groups=norm_num_groups, epsilon=1e-6)
+        self.conv_act = nn.Silu()
+        self.conv_out = nn.Conv2D(block_out_channels[0], out_channels, 3, padding=1)
 
     def forward(self, z):
         sample = z
@@ -195,7 +197,7 @@ class Decoder(nn.Module):
         return sample
 
 
-class VectorQuantizer(nn.Module):
+class VectorQuantizer(nn.Layer):
     """
     Improved version over VectorQuantizer, can be used as a drop-in replacement. Mostly avoids costly matrix
     multiplications and allows for post-hoc remapping of indices.
@@ -213,12 +215,13 @@ class VectorQuantizer(nn.Module):
         self.beta = beta
         self.legacy = legacy
 
-        self.embedding = nn.Embedding(self.n_e, self.vq_embed_dim)
-        self.embedding.weight.data.uniform_(-1.0 / self.n_e, 1.0 / self.n_e)
+        self.embedding = nn.Embedding(
+            self.n_e, self.vq_embed_dim, weight_attr=nn.initializer.Uniform(-1.0 / self.n_e, 1.0 / self.n_e)
+        )
 
         self.remap = remap
         if self.remap is not None:
-            self.register_buffer("used", torch.tensor(np.load(self.remap)))
+            self.register_buffer("used", paddle.to_tensor(np.load(self.remap)))
             self.re_embed = self.used.shape[0]
             self.unknown_index = unknown_index  # "random" or "extra" or integer
             if self.unknown_index == "extra":
@@ -236,13 +239,13 @@ class VectorQuantizer(nn.Module):
     def remap_to_used(self, inds):
         ishape = inds.shape
         assert len(ishape) > 1
-        inds = inds.reshape(ishape[0], -1)
-        used = self.used.to(inds)
-        match = (inds[:, :, None] == used[None, None, ...]).long()
+        inds = inds.reshape([ishape[0], -1])
+        used = self.used.cast(inds.dtype)
+        match = (inds[:, :, None] == used[None, None, ...]).cast("int64")
         new = match.argmax(-1)
         unknown = match.sum(2) < 1
         if self.unknown_index == "random":
-            new[unknown] = torch.randint(0, self.re_embed, size=new[unknown].shape).to(device=new.device)
+            new[unknown] = paddle.randint(0, self.re_embed, shape=new[unknown].shape)
         else:
             new[unknown] = self.unknown_index
         return new.reshape(ishape)
@@ -250,61 +253,70 @@ class VectorQuantizer(nn.Module):
     def unmap_to_all(self, inds):
         ishape = inds.shape
         assert len(ishape) > 1
-        inds = inds.reshape(ishape[0], -1)
-        used = self.used.to(inds)
+        inds = inds.reshape([ishape[0], -1])
+        used = self.used.cast(inds.dtype)
         if self.re_embed > self.used.shape[0]:  # extra token
             inds[inds >= self.used.shape[0]] = 0  # simply set to zero
-        back = torch.gather(used[None, :][inds.shape[0] * [0], :], 1, inds)
+        back = paddle.take_along_axis(used[None, :][inds.shape[0] * [0], :], inds, axis=1)
         return back.reshape(ishape)
 
     def forward(self, z):
         # reshape z -> (batch, height, width, channel) and flatten
-        z = z.permute(0, 2, 3, 1).contiguous()
-        z_flattened = z.view(-1, self.vq_embed_dim)
-
+        z = z.transpose([0, 2, 3, 1])
+        z_flattened = z.reshape([-1, self.vq_embed_dim])
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
-        min_encoding_indices = torch.argmin(torch.cdist(z_flattened, self.embedding.weight), dim=1)
 
-        z_q = self.embedding(min_encoding_indices).view(z.shape)
+        d = (
+            paddle.sum(z_flattened**2, axis=1, keepdim=True)
+            + paddle.sum(self.embedding.weight**2, axis=1)
+            - 2 * paddle.matmul(z_flattened, self.embedding.weight, transpose_y=True)
+        )
+
+        min_encoding_indices = paddle.argmin(d, axis=1)
+        z_q = self.embedding(min_encoding_indices).reshape(z.shape)
         perplexity = None
         min_encodings = None
 
         # compute loss for embedding
         if not self.legacy:
-            loss = self.beta * torch.mean((z_q.detach() - z) ** 2) + torch.mean((z_q - z.detach()) ** 2)
+            loss = self.beta * paddle.mean((z_q.detach() - z) ** 2) + paddle.mean((z_q - z.detach()) ** 2)
         else:
-            loss = torch.mean((z_q.detach() - z) ** 2) + self.beta * torch.mean((z_q - z.detach()) ** 2)
+            loss = paddle.mean((z_q.detach() - z) ** 2) + self.beta * paddle.mean((z_q - z.detach()) ** 2)
 
         # preserve gradients
         z_q = z + (z_q - z).detach()
 
         # reshape back to match original input shape
-        z_q = z_q.permute(0, 3, 1, 2).contiguous()
+        z_q = z_q.transpose([0, 3, 1, 2])
 
         if self.remap is not None:
-            min_encoding_indices = min_encoding_indices.reshape(z.shape[0], -1)  # add batch axis
+            min_encoding_indices = min_encoding_indices.reshape([z.shape[0], -1])  # add batch axis
             min_encoding_indices = self.remap_to_used(min_encoding_indices)
-            min_encoding_indices = min_encoding_indices.reshape(-1, 1)  # flatten
+            min_encoding_indices = min_encoding_indices.reshape([-1, 1])  # flatten
 
         if self.sane_index_shape:
-            min_encoding_indices = min_encoding_indices.reshape(z_q.shape[0], z_q.shape[2], z_q.shape[3])
+            min_encoding_indices = min_encoding_indices.reshape([z_q.shape[0], z_q.shape[2], z_q.shape[3]])
 
         return z_q, loss, (perplexity, min_encodings, min_encoding_indices)
 
     def get_codebook_entry(self, indices, shape):
         # shape specifying (batch, height, width, channel)
         if self.remap is not None:
-            indices = indices.reshape(shape[0], -1)  # add batch axis
+            indices = indices.reshape([shape[0], -1])  # add batch axis
             indices = self.unmap_to_all(indices)
-            indices = indices.reshape(-1)  # flatten again
+            indices = indices.reshape(
+                [
+                    -1,
+                ]
+            )  # flatten again
 
         # get quantized latent vectors
         z_q = self.embedding(indices)
 
         if shape is not None:
-            z_q = z_q.view(shape)
+            z_q = z_q.reshape(shape)
             # reshape back to match original input shape
-            z_q = z_q.permute(0, 3, 1, 2).contiguous()
+            z_q = z_q.transpose([0, 3, 1, 2])
 
         return z_q
 
@@ -312,45 +324,41 @@ class VectorQuantizer(nn.Module):
 class DiagonalGaussianDistribution(object):
     def __init__(self, parameters, deterministic=False):
         self.parameters = parameters
-        self.mean, self.logvar = torch.chunk(parameters, 2, dim=1)
-        self.logvar = torch.clamp(self.logvar, -30.0, 20.0)
+        self.mean, self.logvar = paddle.chunk(parameters, 2, axis=1)
+        self.logvar = paddle.clip(self.logvar, -30.0, 20.0)
         self.deterministic = deterministic
-        self.std = torch.exp(0.5 * self.logvar)
-        self.var = torch.exp(self.logvar)
+        self.std = paddle.exp(0.5 * self.logvar)
+        self.var = paddle.exp(self.logvar)
         if self.deterministic:
-            self.var = self.std = torch.zeros_like(
-                self.mean, device=self.parameters.device, dtype=self.parameters.dtype
-            )
+            self.var = self.std = paddle.zeros_like(self.mean, dtype=self.parameters.dtype)
 
-    def sample(self, generator: Optional[torch.Generator] = None) -> torch.FloatTensor:
+    def sample(self, generator: Optional[paddle.Generator] = None) -> paddle.Tensor:
         # make sure sample is on the same device as the parameters and has same dtype
-        sample = randn_tensor(
-            self.mean.shape, generator=generator, device=self.parameters.device, dtype=self.parameters.dtype
-        )
+        sample = randn_tensor(self.mean.shape, generator=generator, dtype=self.parameters.dtype)
         x = self.mean + self.std * sample
         return x
 
     def kl(self, other=None):
         if self.deterministic:
-            return torch.Tensor([0.0])
+            return paddle.to_tensor([0.0])
         else:
             if other is None:
-                return 0.5 * torch.sum(torch.pow(self.mean, 2) + self.var - 1.0 - self.logvar, dim=[1, 2, 3])
+                return 0.5 * paddle.sum(paddle.pow(self.mean, 2) + self.var - 1.0 - self.logvar, axis=[1, 2, 3])
             else:
-                return 0.5 * torch.sum(
-                    torch.pow(self.mean - other.mean, 2) / other.var
+                return 0.5 * paddle.sum(
+                    paddle.pow(self.mean - other.mean, 2) / other.var
                     + self.var / other.var
                     - 1.0
                     - self.logvar
                     + other.logvar,
-                    dim=[1, 2, 3],
+                    axis=[1, 2, 3],
                 )
 
-    def nll(self, sample, dims=[1, 2, 3]):
+    def nll(self, sample, axis=[1, 2, 3]):
         if self.deterministic:
-            return torch.Tensor([0.0])
+            return paddle.to_tensor([0.0])
         logtwopi = np.log(2.0 * np.pi)
-        return 0.5 * torch.sum(logtwopi + self.logvar + torch.pow(sample - self.mean, 2) / self.var, dim=dims)
+        return 0.5 * paddle.sum(logtwopi + self.logvar + paddle.pow(sample - self.mean, 2) / self.var, axis=axis)
 
     def mode(self):
         return self.mean

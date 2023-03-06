@@ -14,23 +14,23 @@
 import math
 from typing import Callable, Optional
 
-import torch
-import torch.nn.functional as F
-from torch import nn
+import paddle
+import paddle.nn.functional as F
+from paddle import nn
 
-from ..utils.import_utils import is_xformers_available
+from ..utils import is_cutlass_fused_multi_head_attention_available
 from .cross_attention import CrossAttention
 from .embeddings import CombinedTimestepLabelEmbeddings
 
+if is_cutlass_fused_multi_head_attention_available():
+    from paddle.incubate.nn.functional import cutlass_fused_multi_head_attention
 
-if is_xformers_available():
-    import xformers
-    import xformers.ops
+    # cutlass_fused_multi_head_attention = paddle.amp.auto_cast(False)(cutlass_fused_multi_head_attention)
 else:
-    xformers = None
+    cutlass_fused_multi_head_attention = None
 
 
-class AttentionBlock(nn.Module):
+class AttentionBlock(nn.Layer):
     """
     An attention block that allows spatial positions to attend to each other. Originally ported from here, but adapted
     to the N-d case.
@@ -60,8 +60,10 @@ class AttentionBlock(nn.Module):
         self.channels = channels
 
         self.num_heads = channels // num_head_channels if num_head_channels is not None else 1
-        self.num_head_size = num_head_channels
-        self.group_norm = nn.GroupNorm(num_channels=channels, num_groups=norm_num_groups, eps=eps, affine=True)
+        self.num_head_size = self.channels // self.num_heads
+        self.scale = 1 / math.sqrt(self.channels / self.num_heads)
+
+        self.group_norm = nn.GroupNorm(num_channels=channels, num_groups=norm_num_groups, epsilon=eps)
 
         # define q,k,v as linear layers
         self.query = nn.Linear(channels, channels)
@@ -69,49 +71,38 @@ class AttentionBlock(nn.Module):
         self.value = nn.Linear(channels, channels)
 
         self.rescale_output_factor = rescale_output_factor
-        self.proj_attn = nn.Linear(channels, channels, 1)
+        self.proj_attn = nn.Linear(channels, channels)
 
         self._use_memory_efficient_attention_xformers = False
         self._attention_op = None
 
-    def reshape_heads_to_batch_dim(self, tensor):
-        batch_size, seq_len, dim = tensor.shape
-        head_size = self.num_heads
-        tensor = tensor.reshape(batch_size, seq_len, head_size, dim // head_size)
-        tensor = tensor.permute(0, 2, 1, 3).reshape(batch_size * head_size, seq_len, dim // head_size)
+    def reshape_heads_to_batch_dim(self, tensor, transpose=True):
+        tensor = tensor.reshape([0, 0, self.num_heads, self.num_head_size])
+        if transpose:
+            tensor = tensor.transpose([0, 2, 1, 3])
         return tensor
 
-    def reshape_batch_dim_to_heads(self, tensor):
-        batch_size, seq_len, dim = tensor.shape
-        head_size = self.num_heads
-        tensor = tensor.reshape(batch_size // head_size, head_size, seq_len, dim)
-        tensor = tensor.permute(0, 2, 1, 3).reshape(batch_size // head_size, seq_len, dim * head_size)
+    def reshape_batch_dim_to_heads(self, tensor, transpose=True):
+        if transpose:
+            tensor = tensor.transpose([0, 2, 1, 3])
+        tensor = tensor.reshape([0, 0, tensor.shape[2] * tensor.shape[3]])
         return tensor
 
     def set_use_memory_efficient_attention_xformers(
         self, use_memory_efficient_attention_xformers: bool, attention_op: Optional[Callable] = None
     ):
         if use_memory_efficient_attention_xformers:
-            if not is_xformers_available():
-                raise ModuleNotFoundError(
-                    (
-                        "Refer to https://github.com/facebookresearch/xformers for more information on how to install"
-                        " xformers"
-                    ),
-                    name="xformers",
-                )
-            elif not torch.cuda.is_available():
-                raise ValueError(
-                    "torch.cuda.is_available() should be True but is False. xformers' memory efficient attention is"
-                    " only available for GPU "
+            if not is_cutlass_fused_multi_head_attention_available():
+                raise NotImplementedError(
+                    "requires the CUTLASS_FUSED_MULTI_HEAD_ATTENTIOPN but your PaddlePaddle donot have this. Checkout the instructions on the installation page: https://www.paddlepaddle.org.cn/install/quick and follow the ones that match your environment."
                 )
             else:
                 try:
-                    # Make sure we can run the memory efficient attention
-                    _ = xformers.ops.memory_efficient_attention(
-                        torch.randn((1, 2, 40), device="cuda"),
-                        torch.randn((1, 2, 40), device="cuda"),
-                        torch.randn((1, 2, 40), device="cuda"),
+                    # Make sure we can run the cutlass_fused_multi_head_attention
+                    _ = cutlass_fused_multi_head_attention(
+                        paddle.randn((1, 1, 2, 40)),
+                        paddle.randn((1, 1, 2, 40)),
+                        paddle.randn((1, 1, 2, 40)),
                     )
                 except Exception as e:
                     raise e
@@ -125,56 +116,40 @@ class AttentionBlock(nn.Module):
         # norm
         hidden_states = self.group_norm(hidden_states)
 
-        hidden_states = hidden_states.view(batch, channel, height * width).transpose(1, 2)
+        hidden_states = hidden_states.reshape([batch, channel, height * width]).transpose([0, 2, 1])
 
         # proj to q, k, v
         query_proj = self.query(hidden_states)
         key_proj = self.key(hidden_states)
         value_proj = self.value(hidden_states)
 
-        scale = 1 / math.sqrt(self.channels / self.num_heads)
-
-        query_proj = self.reshape_heads_to_batch_dim(query_proj)
-        key_proj = self.reshape_heads_to_batch_dim(key_proj)
-        value_proj = self.reshape_heads_to_batch_dim(value_proj)
+        query_proj = self.reshape_heads_to_batch_dim(query_proj, transpose=False)
+        key_proj = self.reshape_heads_to_batch_dim(key_proj, transpose=False)
+        value_proj = self.reshape_heads_to_batch_dim(value_proj, transpose=False)
 
         if self._use_memory_efficient_attention_xformers:
             # Memory efficient attention
-            hidden_states = xformers.ops.memory_efficient_attention(
-                query_proj, key_proj, value_proj, attn_bias=None, op=self._attention_op
-            )
-            hidden_states = hidden_states.to(query_proj.dtype)
+            hidden_states = cutlass_fused_multi_head_attention(query_proj, key_proj, value_proj, None, self.scale)
+            hidden_states = hidden_states.cast(query_proj.dtype)
         else:
-            attention_scores = torch.baddbmm(
-                torch.empty(
-                    query_proj.shape[0],
-                    query_proj.shape[1],
-                    key_proj.shape[1],
-                    dtype=query_proj.dtype,
-                    device=query_proj.device,
-                ),
-                query_proj,
-                key_proj.transpose(-1, -2),
-                beta=0,
-                alpha=scale,
-            )
-            attention_probs = torch.softmax(attention_scores.float(), dim=-1).type(attention_scores.dtype)
-            hidden_states = torch.bmm(attention_probs, value_proj)
+            attention_scores = paddle.matmul(query_proj, key_proj, transpose_y=True) * self.scale
+            attention_probs = F.softmax(attention_scores.cast("float32"), axis=-1).cast(attention_scores.dtype)
+            hidden_states = paddle.matmul(attention_probs, value_proj)
 
         # reshape hidden_states
-        hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
+        hidden_states = self.reshape_batch_dim_to_heads(hidden_states, transpose=False)
 
         # compute next hidden_states
         hidden_states = self.proj_attn(hidden_states)
 
-        hidden_states = hidden_states.transpose(-1, -2).reshape(batch, channel, height, width)
+        hidden_states = hidden_states.transpose([0, 2, 1]).reshape([batch, channel, height, width])
 
         # res connect and rescale
         hidden_states = (hidden_states + residual) / self.rescale_output_factor
         return hidden_states
 
 
-class BasicTransformerBlock(nn.Module):
+class BasicTransformerBlock(nn.Layer):
     r"""
     A basic Transformer block.
 
@@ -246,27 +221,30 @@ class BasicTransformerBlock(nn.Module):
         else:
             self.attn2 = None
 
+        if not norm_elementwise_affine:
+            norm_kwargs = {"weight_attr": False, "bias_attr": False}
+        else:
+            norm_kwargs = {}
+
         if self.use_ada_layer_norm:
             self.norm1 = AdaLayerNorm(dim, num_embeds_ada_norm)
         elif self.use_ada_layer_norm_zero:
             self.norm1 = AdaLayerNormZero(dim, num_embeds_ada_norm)
         else:
-            self.norm1 = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine)
+            self.norm1 = nn.LayerNorm(dim, **norm_kwargs)
 
         if cross_attention_dim is not None:
             # We currently only use AdaLayerNormZero for self attention where there will only be one attention block.
             # I.e. the number of returned modulation chunks from AdaLayerZero would not make sense if returned during
             # the second cross attention block.
             self.norm2 = (
-                AdaLayerNorm(dim, num_embeds_ada_norm)
-                if self.use_ada_layer_norm
-                else nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine)
+                AdaLayerNorm(dim, num_embeds_ada_norm) if self.use_ada_layer_norm else nn.LayerNorm(dim, **norm_kwargs)
             )
         else:
             self.norm2 = None
 
         # 3. Feed-forward
-        self.norm3 = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine)
+        self.norm3 = nn.LayerNorm(dim, **norm_kwargs)
 
     def forward(
         self,
@@ -328,7 +306,7 @@ class BasicTransformerBlock(nn.Module):
         return hidden_states
 
 
-class FeedForward(nn.Module):
+class FeedForward(nn.Layer):
     r"""
     A feed-forward layer.
 
@@ -363,7 +341,7 @@ class FeedForward(nn.Module):
         elif activation_fn == "geglu-approximate":
             act_fn = ApproximateGELU(dim, inner_dim)
 
-        self.net = nn.ModuleList([])
+        self.net = nn.LayerList([])
         # project in
         self.net.append(act_fn)
         # project dropout
@@ -380,7 +358,7 @@ class FeedForward(nn.Module):
         return hidden_states
 
 
-class GELU(nn.Module):
+class GELU(nn.Layer):
     r"""
     GELU activation function with tanh approximation support with `approximate="tanh"`.
     """
@@ -389,20 +367,15 @@ class GELU(nn.Module):
         super().__init__()
         self.proj = nn.Linear(dim_in, dim_out)
         self.approximate = approximate
-
-    def gelu(self, gate):
-        if gate.device.type != "mps":
-            return F.gelu(gate, approximate=self.approximate)
-        # mps: gelu is not implemented for float16
-        return F.gelu(gate.to(dtype=torch.float32), approximate=self.approximate).to(dtype=gate.dtype)
+        self.approximate_bool = approximate == "tanh"
 
     def forward(self, hidden_states):
         hidden_states = self.proj(hidden_states)
-        hidden_states = self.gelu(hidden_states)
+        hidden_states = F.gelu(hidden_states, approximate=self.approximate_bool)
         return hidden_states
 
 
-class GEGLU(nn.Module):
+class GEGLU(nn.Layer):
     r"""
     A variant of the gated linear unit activation function from https://arxiv.org/abs/2002.05202.
 
@@ -415,18 +388,12 @@ class GEGLU(nn.Module):
         super().__init__()
         self.proj = nn.Linear(dim_in, dim_out * 2)
 
-    def gelu(self, gate):
-        if gate.device.type != "mps":
-            return F.gelu(gate)
-        # mps: gelu is not implemented for float16
-        return F.gelu(gate.to(dtype=torch.float32)).to(dtype=gate.dtype)
-
     def forward(self, hidden_states):
-        hidden_states, gate = self.proj(hidden_states).chunk(2, dim=-1)
-        return hidden_states * self.gelu(gate)
+        hidden_states, gate = self.proj(hidden_states).chunk(2, axis=-1)
+        return hidden_states * F.gelu(gate)
 
 
-class ApproximateGELU(nn.Module):
+class ApproximateGELU(nn.Layer):
     """
     The approximate form of Gaussian Error Linear Unit (GELU)
 
@@ -439,10 +406,10 @@ class ApproximateGELU(nn.Module):
 
     def forward(self, x):
         x = self.proj(x)
-        return x * torch.sigmoid(1.702 * x)
+        return x * F.sigmoid(1.702 * x)
 
 
-class AdaLayerNorm(nn.Module):
+class AdaLayerNorm(nn.Layer):
     """
     Norm layer modified to incorporate timestep embeddings.
     """
@@ -450,18 +417,21 @@ class AdaLayerNorm(nn.Module):
     def __init__(self, embedding_dim, num_embeddings):
         super().__init__()
         self.emb = nn.Embedding(num_embeddings, embedding_dim)
-        self.silu = nn.SiLU()
+        self.silu = nn.Silu()
         self.linear = nn.Linear(embedding_dim, embedding_dim * 2)
-        self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False)
+        # elementwise_affine=False
+        norm_kwargs = {"weight_attr": False, "bias_attr": False}
+        self.norm = nn.LayerNorm(embedding_dim, **norm_kwargs)
 
     def forward(self, x, timestep):
         emb = self.linear(self.silu(self.emb(timestep)))
-        scale, shift = torch.chunk(emb, 2)
+        # must set axis=-1, paddle vs pytorch
+        scale, shift = paddle.chunk(emb, 2, axis=-1)
         x = self.norm(x) * (1 + scale) + shift
         return x
 
 
-class AdaLayerNormZero(nn.Module):
+class AdaLayerNormZero(nn.Layer):
     """
     Norm layer adaptive layer norm zero (adaLN-Zero).
     """
@@ -471,18 +441,20 @@ class AdaLayerNormZero(nn.Module):
 
         self.emb = CombinedTimestepLabelEmbeddings(num_embeddings, embedding_dim)
 
-        self.silu = nn.SiLU()
-        self.linear = nn.Linear(embedding_dim, 6 * embedding_dim, bias=True)
-        self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
+        self.silu = nn.Silu()
+        self.linear = nn.Linear(embedding_dim, 6 * embedding_dim, bias_attr=True)
+        # elementwise_affine=False
+        norm_kwargs = {"weight_attr": False, "bias_attr": False}
+        self.norm = nn.LayerNorm(embedding_dim, epsilon=1e-6, **norm_kwargs)
 
     def forward(self, x, timestep, class_labels, hidden_dtype=None):
         emb = self.linear(self.silu(self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)))
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=1)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, axis=1)
         x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
         return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
 
-class AdaGroupNorm(nn.Module):
+class AdaGroupNorm(nn.Layer):
     """
     GroupNorm layer modified to incorporate timestep embeddings.
     """
@@ -499,19 +471,23 @@ class AdaGroupNorm(nn.Module):
         elif act_fn == "mish":
             self.act = nn.Mish()
         elif act_fn == "silu":
-            self.act = nn.SiLU()
+            self.act = nn.Silu()
         elif act_fn == "gelu":
             self.act = nn.GELU()
 
         self.linear = nn.Linear(embedding_dim, out_dim * 2)
+        # elementwise_affine=False
+        norm_kwargs = {"weight_attr": False, "bias_attr": False}
+        self.group_norm = nn.GroupNorm(num_groups, out_dim, epsilon=eps, **norm_kwargs)
+        self.group_norm.weight = None
+        self.group_norm.bias = None
 
     def forward(self, x, emb):
         if self.act:
             emb = self.act(emb)
         emb = self.linear(emb)
         emb = emb[:, :, None, None]
-        scale, shift = emb.chunk(2, dim=1)
-
-        x = F.group_norm(x, self.num_groups, eps=self.eps)
+        scale, shift = emb.chunk(2, axis=1)
+        x = self.group_norm(x)
         x = x * (1 + scale) + shift
         return x

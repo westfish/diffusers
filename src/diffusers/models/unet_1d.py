@@ -15,8 +15,8 @@
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
-import torch
-import torch.nn as nn
+import paddle
+import paddle.nn as nn
 
 from ..configuration_utils import ConfigMixin, register_to_config
 from ..utils import BaseOutput
@@ -29,11 +29,11 @@ from .unet_1d_blocks import get_down_block, get_mid_block, get_out_block, get_up
 class UNet1DOutput(BaseOutput):
     """
     Args:
-        sample (`torch.FloatTensor` of shape `(batch_size, num_channels, sample_size)`):
+        sample (`paddle.Tensor` of shape `(batch_size, num_channels, sample_size)`):
             Hidden states output. Output of last layer of model.
     """
 
-    sample: torch.FloatTensor
+    sample: paddle.Tensor
 
 
 class UNet1DModel(ModelMixin, ConfigMixin):
@@ -112,9 +112,9 @@ class UNet1DModel(ModelMixin, ConfigMixin):
                 out_dim=block_out_channels[0],
             )
 
-        self.down_blocks = nn.ModuleList([])
+        self.down_blocks = nn.LayerList([])
         self.mid_block = None
-        self.up_blocks = nn.ModuleList([])
+        self.up_blocks = nn.LayerList([])
         self.out_block = None
 
         # down
@@ -189,14 +189,14 @@ class UNet1DModel(ModelMixin, ConfigMixin):
 
     def forward(
         self,
-        sample: torch.FloatTensor,
-        timestep: Union[torch.Tensor, float, int],
+        sample: paddle.Tensor,
+        timestep: Union[paddle.Tensor, float, int],
         return_dict: bool = True,
     ) -> Union[UNet1DOutput, Tuple]:
         r"""
         Args:
-            sample (`torch.FloatTensor`): `(batch_size, sample_size, num_channels)` noisy inputs tensor
-            timestep (`torch.FloatTensor` or `float` or `int): (batch) timesteps
+            sample (`paddle.Tensor`): `(batch_size, sample_size, num_channels)` noisy inputs tensor
+            timestep (`paddle.Tensor` or `float` or `int): (batch) timesteps
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~models.unet_1d.UNet1DOutput`] instead of a plain tuple.
 
@@ -207,17 +207,17 @@ class UNet1DModel(ModelMixin, ConfigMixin):
 
         # 1. time
         timesteps = timestep
-        if not torch.is_tensor(timesteps):
-            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
-        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
-            timesteps = timesteps[None].to(sample.device)
+        if not paddle.is_tensor(timesteps):
+            timesteps = paddle.to_tensor([timesteps], dtype="int64")
+        elif paddle.is_tensor(timesteps) and len(timesteps.shape) == 0:
+            timesteps = timesteps[None]
 
         timestep_embed = self.time_proj(timesteps)
         if self.config.use_timestep_embedding:
             timestep_embed = self.time_mlp(timestep_embed)
         else:
             timestep_embed = timestep_embed[..., None]
-            timestep_embed = timestep_embed.repeat([1, 1, sample.shape[2]]).to(sample.dtype)
+            timestep_embed = timestep_embed.tile([1, 1, sample.shape[2]]).cast(sample.dtype)
             timestep_embed = timestep_embed.broadcast_to((sample.shape[:1] + timestep_embed.shape[1:]))
 
         # 2. down

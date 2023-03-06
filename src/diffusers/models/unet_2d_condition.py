@@ -14,13 +14,13 @@
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import torch
-import torch.nn as nn
-import torch.utils.checkpoint
+import paddle
+import paddle.nn as nn
+import paddle.nn.functional as F
 
 from ..configuration_utils import ConfigMixin, register_to_config
 from ..loaders import UNet2DConditionLoadersMixin
-from ..utils import BaseOutput, logging
+from ..utils import NEG_INF, BaseOutput, logging
 from .cross_attention import AttnProcessor
 from .embeddings import GaussianFourierProjection, TimestepEmbedding, Timesteps
 from .modeling_utils import ModelMixin
@@ -35,7 +35,6 @@ from .unet_2d_blocks import (
     get_up_block,
 )
 
-
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
@@ -43,11 +42,11 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 class UNet2DConditionOutput(BaseOutput):
     """
     Args:
-        sample (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`):
+        sample (`paddle.Tensor` of shape `(batch_size, num_channels, height, width)`):
             Hidden states conditioned on `encoder_hidden_states` input. Output of last layer of model.
     """
 
-    sample: torch.FloatTensor
+    sample: paddle.Tensor
 
 
 class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
@@ -148,6 +147,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         conv_in_kernel: int = 3,
         conv_out_kernel: int = 3,
         projection_class_embeddings_input_dim: Optional[int] = None,
+        resnet_pre_temb_non_linearity: Optional[bool] = False,
     ):
         super().__init__()
 
@@ -176,7 +176,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
 
         # input
         conv_in_padding = (conv_in_kernel - 1) // 2
-        self.conv_in = nn.Conv2d(
+        self.conv_in = nn.Conv2D(
             in_channels, block_out_channels[0], kernel_size=conv_in_kernel, padding=conv_in_padding
         )
 
@@ -230,14 +230,25 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         else:
             self.class_embedding = None
 
-        self.down_blocks = nn.ModuleList([])
-        self.up_blocks = nn.ModuleList([])
+        self.down_blocks = nn.LayerList([])
+        self.up_blocks = nn.LayerList([])
 
         if isinstance(only_cross_attention, bool):
             only_cross_attention = [only_cross_attention] * len(down_block_types)
 
         if isinstance(attention_head_dim, int):
             attention_head_dim = (attention_head_dim,) * len(down_block_types)
+
+        # pre_temb_act_fun opt
+        self.resnet_pre_temb_non_linearity = resnet_pre_temb_non_linearity
+        if act_fn == "swish":
+            self.down_resnet_temb_nonlinearity = lambda x: F.silu(x)
+        elif act_fn == "mish":
+            self.down_resnet_temb_nonlinearity = nn.Mish()
+        elif act_fn == "silu":
+            self.down_resnet_temb_nonlinearity = nn.Silu()
+        elif act_fn == "gelu":
+            self.down_resnet_temb_nonlinearity = nn.GELU()
 
         # down
         output_channel = block_out_channels[0]
@@ -264,6 +275,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 only_cross_attention=only_cross_attention[i],
                 upcast_attention=upcast_attention,
                 resnet_time_scale_shift=resnet_time_scale_shift,
+                resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
             )
             self.down_blocks.append(down_block)
 
@@ -282,6 +294,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 dual_cross_attention=dual_cross_attention,
                 use_linear_projection=use_linear_projection,
                 upcast_attention=upcast_attention,
+                resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
             )
         elif mid_block_type == "UNetMidBlock2DSimpleCrossAttn":
             self.mid_block = UNetMidBlock2DSimpleCrossAttn(
@@ -294,6 +307,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 attn_num_head_channels=attention_head_dim[-1],
                 resnet_groups=norm_num_groups,
                 resnet_time_scale_shift=resnet_time_scale_shift,
+                resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
             )
         elif mid_block_type is None:
             self.mid_block = None
@@ -306,7 +320,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         # up
         reversed_block_out_channels = list(reversed(block_out_channels))
         reversed_attention_head_dim = list(reversed(attention_head_dim))
-        only_cross_attention = list(reversed(only_cross_attention))
+        reversed_only_cross_attention = list(reversed(only_cross_attention))
 
         output_channel = reversed_block_out_channels[0]
         for i, up_block_type in enumerate(up_block_types):
@@ -338,9 +352,10 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 attn_num_head_channels=reversed_attention_head_dim[i],
                 dual_cross_attention=dual_cross_attention,
                 use_linear_projection=use_linear_projection,
-                only_cross_attention=only_cross_attention[i],
+                only_cross_attention=reversed_only_cross_attention[i],
                 upcast_attention=upcast_attention,
                 resnet_time_scale_shift=resnet_time_scale_shift,
+                resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
             )
             self.up_blocks.append(up_block)
             prev_output_channel = output_channel
@@ -348,15 +363,15 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         # out
         if norm_num_groups is not None:
             self.conv_norm_out = nn.GroupNorm(
-                num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=norm_eps
+                num_channels=block_out_channels[0], num_groups=norm_num_groups, epsilon=norm_eps
             )
-            self.conv_act = nn.SiLU()
+            self.conv_act = nn.Silu()
         else:
             self.conv_norm_out = None
             self.conv_act = None
 
         conv_out_padding = (conv_out_kernel - 1) // 2
-        self.conv_out = nn.Conv2d(
+        self.conv_out = nn.Conv2D(
             block_out_channels[0], out_channels, kernel_size=conv_out_kernel, padding=conv_out_padding
         )
 
@@ -370,7 +385,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         # set recursively
         processors = {}
 
-        def fn_recursive_add_processors(name: str, module: torch.nn.Module, processors: Dict[str, AttnProcessor]):
+        def fn_recursive_add_processors(name: str, module: nn.Layer, processors: Dict[str, AttnProcessor]):
             if hasattr(module, "set_processor"):
                 processors[f"{name}.processor"] = module.processor
 
@@ -401,7 +416,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 f" number of attention layers: {count}. Please make sure to pass {count} processor classes."
             )
 
-        def fn_recursive_attn_processor(name: str, module: torch.nn.Module, processor):
+        def fn_recursive_attn_processor(name: str, module: nn.Layer, processor):
             if hasattr(module, "set_processor"):
                 if not isinstance(processor, dict):
                     module.set_processor(processor)
@@ -430,7 +445,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         """
         sliceable_head_dims = []
 
-        def fn_recursive_retrieve_slicable_dims(module: torch.nn.Module):
+        def fn_recursive_retrieve_slicable_dims(module: nn.Layer):
             if hasattr(module, "set_attention_slice"):
                 sliceable_head_dims.append(module.sliceable_head_dim)
 
@@ -468,7 +483,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         # Recursively walk through all the children.
         # Any children which exposes the set_attention_slice method
         # gets the message
-        def fn_recursive_set_attention_slice(module: torch.nn.Module, slice_size: List[int]):
+        def fn_recursive_set_attention_slice(module: nn.Layer, slice_size: List[int]):
             if hasattr(module, "set_attention_slice"):
                 module.set_attention_slice(slice_size.pop())
 
@@ -485,20 +500,20 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
 
     def forward(
         self,
-        sample: torch.FloatTensor,
-        timestep: Union[torch.Tensor, float, int],
-        encoder_hidden_states: torch.Tensor,
-        class_labels: Optional[torch.Tensor] = None,
-        timestep_cond: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+        sample: paddle.Tensor,
+        timestep: Union[paddle.Tensor, float, int],
+        encoder_hidden_states: paddle.Tensor,
+        class_labels: Optional[paddle.Tensor] = None,
+        timestep_cond: Optional[paddle.Tensor] = None,
+        attention_mask: Optional[paddle.Tensor] = None,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
     ) -> Union[UNet2DConditionOutput, Tuple]:
         r"""
         Args:
-            sample (`torch.FloatTensor`): (batch, channel, height, width) noisy inputs tensor
-            timestep (`torch.FloatTensor` or `float` or `int`): (batch) timesteps
-            encoder_hidden_states (`torch.FloatTensor`): (batch, sequence_length, feature_dim) encoder hidden states
+            sample (`paddle.Tensor`): (batch, channel, height, width) noisy inputs tensor
+            timestep (`paddle.Tensor` or `float` or `int`): (batch) timesteps
+            encoder_hidden_states (`paddle.Tensor`): (batch, sequence_length, feature_dim) encoder hidden states
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`models.unet_2d_condition.UNet2DConditionOutput`] instead of a plain tuple.
             cross_attention_kwargs (`dict`, *optional*):
@@ -527,7 +542,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
 
         # prepare attention_mask
         if attention_mask is not None:
-            attention_mask = (1 - attention_mask.to(sample.dtype)) * -10000.0
+            attention_mask = (1 - attention_mask.cast(sample.dtype)) * NEG_INF
             attention_mask = attention_mask.unsqueeze(1)
 
         # 0. center input if necessary
@@ -536,27 +551,25 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
 
         # 1. time
         timesteps = timestep
-        if not torch.is_tensor(timesteps):
-            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-            # This would be a good case for the `match` statement (Python 3.10+)
-            is_mps = sample.device.type == "mps"
-            if isinstance(timestep, float):
-                dtype = torch.float32 if is_mps else torch.float64
-            else:
-                dtype = torch.int32 if is_mps else torch.int64
-            timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
+        if not paddle.is_tensor(timesteps):
+            timesteps = paddle.to_tensor([timesteps], dtype="int64")
         elif len(timesteps.shape) == 0:
-            timesteps = timesteps[None].to(sample.device)
+            timesteps = timesteps[None]
 
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-        timesteps = timesteps.expand(sample.shape[0])
-
+        timesteps = timesteps.expand(
+            [
+                sample.shape[0],
+            ]
+        )
         t_emb = self.time_proj(timesteps)
 
         # timesteps does not contain any weights and will always return f32 tensors
         # but time_embedding might actually be running in fp16. so we need to cast here.
         # there might be better ways to encapsulate this.
-        t_emb = t_emb.to(dtype=self.dtype)
+        t_emb = t_emb.cast(self.dtype)
+        # TODO junnyu, add this to support pure fp16
+        sample = sample.cast(self.dtype)
 
         emb = self.time_embedding(t_emb, timestep_cond)
 
@@ -567,7 +580,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             if self.config.class_embed_type == "timestep":
                 class_labels = self.time_proj(class_labels)
 
-            class_emb = self.class_embedding(class_labels).to(dtype=self.dtype)
+            class_emb = self.class_embedding(class_labels).cast(self.dtype)
             emb = emb + class_emb
 
         # 2. pre-process
@@ -575,17 +588,21 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
 
         # 3. down
         down_block_res_samples = (sample,)
+
+        # ! resnet_pre_temb_non_linearity
+        down_nonlinear_temb = self.down_resnet_temb_nonlinearity(emb) if self.resnet_pre_temb_non_linearity else emb
+
         for downsample_block in self.down_blocks:
             if hasattr(downsample_block, "has_cross_attention") and downsample_block.has_cross_attention:
                 sample, res_samples = downsample_block(
                     hidden_states=sample,
-                    temb=emb,
+                    temb=down_nonlinear_temb,
                     encoder_hidden_states=encoder_hidden_states,
                     attention_mask=attention_mask,
                     cross_attention_kwargs=cross_attention_kwargs,
                 )
             else:
-                sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
+                sample, res_samples = downsample_block(hidden_states=sample, temb=down_nonlinear_temb)
 
             down_block_res_samples += res_samples
 
@@ -593,7 +610,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         if self.mid_block is not None:
             sample = self.mid_block(
                 sample,
-                emb,
+                down_nonlinear_temb,
                 encoder_hidden_states=encoder_hidden_states,
                 attention_mask=attention_mask,
                 cross_attention_kwargs=cross_attention_kwargs,
@@ -614,7 +631,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             if hasattr(upsample_block, "has_cross_attention") and upsample_block.has_cross_attention:
                 sample = upsample_block(
                     hidden_states=sample,
-                    temb=emb,
+                    temb=down_nonlinear_temb,
                     res_hidden_states_tuple=res_samples,
                     encoder_hidden_states=encoder_hidden_states,
                     cross_attention_kwargs=cross_attention_kwargs,
@@ -623,7 +640,10 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 )
             else:
                 sample = upsample_block(
-                    hidden_states=sample, temb=emb, res_hidden_states_tuple=res_samples, upsample_size=upsample_size
+                    hidden_states=sample,
+                    temb=down_nonlinear_temb,
+                    res_hidden_states_tuple=res_samples,
+                    upsample_size=upsample_size,
                 )
         # 6. post-process
         if self.conv_norm_out:

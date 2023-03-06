@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
-import torch
-import torch.nn as nn
+import paddle
+import paddle.nn as nn
 
 from ..configuration_utils import ConfigMixin, register_to_config
 from ..utils import BaseOutput
@@ -29,11 +29,11 @@ class VQEncoderOutput(BaseOutput):
     Output of VQModel encoding method.
 
     Args:
-        latents (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`):
+        latents (`paddle.Tensor` of shape `(batch_size, num_channels, height, width)`):
             Encoded output sample of the model. Output of the last layer of the model.
     """
 
-    latents: torch.FloatTensor
+    latents: paddle.Tensor
 
 
 class VQModel(ModelMixin, ConfigMixin):
@@ -99,9 +99,9 @@ class VQModel(ModelMixin, ConfigMixin):
 
         vq_embed_dim = vq_embed_dim if vq_embed_dim is not None else latent_channels
 
-        self.quant_conv = nn.Conv2d(latent_channels, vq_embed_dim, 1)
+        self.quant_conv = nn.Conv2D(latent_channels, vq_embed_dim, 1)
         self.quantize = VectorQuantizer(num_vq_embeddings, vq_embed_dim, beta=0.25, remap=None, sane_index_shape=False)
-        self.post_quant_conv = nn.Conv2d(vq_embed_dim, latent_channels, 1)
+        self.post_quant_conv = nn.Conv2D(vq_embed_dim, latent_channels, 1)
 
         # pass init params to Decoder
         self.decoder = Decoder(
@@ -114,7 +114,7 @@ class VQModel(ModelMixin, ConfigMixin):
             norm_num_groups=norm_num_groups,
         )
 
-    def encode(self, x: torch.FloatTensor, return_dict: bool = True) -> VQEncoderOutput:
+    def encode(self, x: paddle.Tensor, return_dict: bool = True):
         h = self.encoder(x)
         h = self.quant_conv(h)
 
@@ -123,9 +123,7 @@ class VQModel(ModelMixin, ConfigMixin):
 
         return VQEncoderOutput(latents=h)
 
-    def decode(
-        self, h: torch.FloatTensor, force_not_quantize: bool = False, return_dict: bool = True
-    ) -> Union[DecoderOutput, torch.FloatTensor]:
+    def decode(self, h: paddle.Tensor, force_not_quantize: bool = False, return_dict: bool = True):
         # also go through quantization layer
         if not force_not_quantize:
             quant, emb_loss, info = self.quantize(h)
@@ -139,10 +137,10 @@ class VQModel(ModelMixin, ConfigMixin):
 
         return DecoderOutput(sample=dec)
 
-    def forward(self, sample: torch.FloatTensor, return_dict: bool = True) -> Union[DecoderOutput, torch.FloatTensor]:
+    def forward(self, sample: paddle.Tensor, return_dict: bool = True):
         r"""
         Args:
-            sample (`torch.FloatTensor`): Input sample.
+            sample (`paddle.Tensor`): Input sample.
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`DecoderOutput`] instead of a plain tuple.
         """

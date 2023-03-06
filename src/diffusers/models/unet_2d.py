@@ -14,8 +14,9 @@
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
-import torch
-import torch.nn as nn
+import paddle
+import paddle.nn as nn
+import paddle.nn.functional as F
 
 from ..configuration_utils import ConfigMixin, register_to_config
 from ..utils import BaseOutput
@@ -28,11 +29,11 @@ from .unet_2d_blocks import UNetMidBlock2D, get_down_block, get_up_block
 class UNet2DOutput(BaseOutput):
     """
     Args:
-        sample (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`):
+        sample (`paddle.Tensor` of shape `(batch_size, num_channels, height, width)`):
             Hidden states output. Output of last layer of model.
     """
 
-    sample: torch.FloatTensor
+    sample: paddle.Tensor
 
 
 class UNet2DModel(ModelMixin, ConfigMixin):
@@ -101,6 +102,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
         add_attention: bool = True,
         class_embed_type: Optional[str] = None,
         num_class_embeds: Optional[int] = None,
+        resnet_pre_temb_non_linearity: Optional[bool] = False,
     ):
         super().__init__()
 
@@ -119,7 +121,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
             )
 
         # input
-        self.conv_in = nn.Conv2d(in_channels, block_out_channels[0], kernel_size=3, padding=(1, 1))
+        self.conv_in = nn.Conv2D(in_channels, block_out_channels[0], kernel_size=3, padding=(1, 1))
 
         # time
         if time_embedding_type == "fourier":
@@ -141,9 +143,20 @@ class UNet2DModel(ModelMixin, ConfigMixin):
         else:
             self.class_embedding = None
 
-        self.down_blocks = nn.ModuleList([])
+        self.down_blocks = nn.LayerList([])
         self.mid_block = None
-        self.up_blocks = nn.ModuleList([])
+        self.up_blocks = nn.LayerList([])
+
+        # pre_temb_act_fun opt
+        self.resnet_pre_temb_non_linearity = resnet_pre_temb_non_linearity
+        if act_fn == "swish":
+            self.down_resnet_temb_nonlinearity = lambda x: F.silu(x)
+        elif act_fn == "mish":
+            self.down_resnet_temb_nonlinearity = nn.Mish()
+        elif act_fn == "silu":
+            self.down_resnet_temb_nonlinearity = nn.Silu()
+        elif act_fn == "gelu":
+            self.down_resnet_temb_nonlinearity = nn.GELU()
 
         # down
         output_channel = block_out_channels[0]
@@ -165,6 +178,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
                 attn_num_head_channels=attention_head_dim,
                 downsample_padding=downsample_padding,
                 resnet_time_scale_shift=resnet_time_scale_shift,
+                resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
             )
             self.down_blocks.append(down_block)
 
@@ -179,6 +193,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
             attn_num_head_channels=attention_head_dim,
             resnet_groups=norm_num_groups,
             add_attention=add_attention,
+            resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
         )
 
         # up
@@ -204,28 +219,31 @@ class UNet2DModel(ModelMixin, ConfigMixin):
                 resnet_groups=norm_num_groups,
                 attn_num_head_channels=attention_head_dim,
                 resnet_time_scale_shift=resnet_time_scale_shift,
+                resnet_pre_temb_non_linearity=resnet_pre_temb_non_linearity,
             )
             self.up_blocks.append(up_block)
             prev_output_channel = output_channel
 
         # out
         num_groups_out = norm_num_groups if norm_num_groups is not None else min(block_out_channels[0] // 4, 32)
-        self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[0], num_groups=num_groups_out, eps=norm_eps)
-        self.conv_act = nn.SiLU()
-        self.conv_out = nn.Conv2d(block_out_channels[0], out_channels, kernel_size=3, padding=1)
+        self.conv_norm_out = nn.GroupNorm(
+            num_channels=block_out_channels[0], num_groups=num_groups_out, epsilon=norm_eps
+        )
+        self.conv_act = nn.Silu()
+        self.conv_out = nn.Conv2D(block_out_channels[0], out_channels, kernel_size=3, padding=1)
 
     def forward(
         self,
-        sample: torch.FloatTensor,
-        timestep: Union[torch.Tensor, float, int],
-        class_labels: Optional[torch.Tensor] = None,
+        sample: paddle.Tensor,
+        timestep: Union[paddle.Tensor, float, int],
+        class_labels: Optional[paddle.Tensor] = None,
         return_dict: bool = True,
     ) -> Union[UNet2DOutput, Tuple]:
         r"""
         Args:
-            sample (`torch.FloatTensor`): (batch, channel, height, width) noisy inputs tensor
-            timestep (`torch.FloatTensor` or `float` or `int): (batch) timesteps
-            class_labels (`torch.FloatTensor`, *optional*, defaults to `None`):
+            sample (`paddle.Tensor`): (batch, channel, height, width) noisy inputs tensor
+            timestep (`paddle.Tensor` or `float` or `int): (batch) timesteps
+            class_labels (`paddle.Tensor`, *optional*, defaults to `None`):
                 Optional class labels for conditioning. Their embeddings will be summed with the timestep embeddings.
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~models.unet_2d.UNet2DOutput`] instead of a plain tuple.
@@ -240,20 +258,24 @@ class UNet2DModel(ModelMixin, ConfigMixin):
 
         # 1. time
         timesteps = timestep
-        if not torch.is_tensor(timesteps):
-            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
-        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
-            timesteps = timesteps[None].to(sample.device)
+        if not paddle.is_tensor(timesteps):
+            timesteps = paddle.to_tensor([timesteps], dtype="int64")
+        elif len(timesteps.shape) == 0:
+            timesteps = timesteps[None]
 
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-        timesteps = timesteps * torch.ones(sample.shape[0], dtype=timesteps.dtype, device=timesteps.device)
+        timesteps = timesteps.expand(
+            [
+                sample.shape[0],
+            ]
+        )
 
         t_emb = self.time_proj(timesteps)
 
         # timesteps does not contain any weights and will always return f32 tensors
         # but time_embedding might actually be running in fp16. so we need to cast here.
         # there might be better ways to encapsulate this.
-        t_emb = t_emb.to(dtype=self.dtype)
+        t_emb = t_emb.cast(self.dtype)
         emb = self.time_embedding(t_emb)
 
         if self.class_embedding is not None:
@@ -263,7 +285,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
             if self.config.class_embed_type == "timestep":
                 class_labels = self.time_proj(class_labels)
 
-            class_emb = self.class_embedding(class_labels).to(dtype=self.dtype)
+            class_emb = self.class_embedding(class_labels).cast(self.dtype)
             emb = emb + class_emb
 
         # 2. pre-process
@@ -272,18 +294,22 @@ class UNet2DModel(ModelMixin, ConfigMixin):
 
         # 3. down
         down_block_res_samples = (sample,)
+
+        # ! resnet_pre_temb_non_linearity
+        down_nonlinear_temb = self.down_resnet_temb_nonlinearity(emb) if self.resnet_pre_temb_non_linearity else emb
+
         for downsample_block in self.down_blocks:
             if hasattr(downsample_block, "skip_conv"):
                 sample, res_samples, skip_sample = downsample_block(
-                    hidden_states=sample, temb=emb, skip_sample=skip_sample
+                    hidden_states=sample, temb=down_nonlinear_temb, skip_sample=skip_sample
                 )
             else:
-                sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
+                sample, res_samples = downsample_block(hidden_states=sample, temb=down_nonlinear_temb)
 
             down_block_res_samples += res_samples
 
         # 4. mid
-        sample = self.mid_block(sample, emb)
+        sample = self.mid_block(sample, down_nonlinear_temb)
 
         # 5. up
         skip_sample = None
@@ -292,9 +318,9 @@ class UNet2DModel(ModelMixin, ConfigMixin):
             down_block_res_samples = down_block_res_samples[: -len(upsample_block.resnets)]
 
             if hasattr(upsample_block, "skip_conv"):
-                sample, skip_sample = upsample_block(sample, res_samples, emb, skip_sample)
+                sample, skip_sample = upsample_block(sample, res_samples, down_nonlinear_temb, skip_sample)
             else:
-                sample = upsample_block(sample, res_samples, emb)
+                sample = upsample_block(sample, res_samples, down_nonlinear_temb)
 
         # 6. post-process
         sample = self.conv_norm_out(sample)
@@ -305,7 +331,7 @@ class UNet2DModel(ModelMixin, ConfigMixin):
             sample += skip_sample
 
         if self.config.time_embedding_type == "fourier":
-            timesteps = timesteps.reshape((sample.shape[0], *([1] * len(sample.shape[1:]))))
+            timesteps = timesteps.reshape([sample.shape[0], *([1] * len(sample.shape[1:]))])
             sample = sample / timesteps
 
         if not return_dict:

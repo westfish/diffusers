@@ -13,12 +13,12 @@
 # limitations under the License.
 from typing import Optional
 
-from torch import nn
+import paddle.nn as nn
 
 from .transformer_2d import Transformer2DModel, Transformer2DModelOutput
 
 
-class DualTransformer2DModel(nn.Module):
+class DualTransformer2DModel(nn.Layer):
     """
     Dual transformer wrapper that combines two `Transformer2DModel`s for mixed inference.
 
@@ -61,7 +61,7 @@ class DualTransformer2DModel(nn.Module):
         num_embeds_ada_norm: Optional[int] = None,
     ):
         super().__init__()
-        self.transformers = nn.ModuleList(
+        self.transformers = nn.LayerList(
             [
                 Transformer2DModel(
                     num_attention_heads=num_attention_heads,
@@ -105,15 +105,15 @@ class DualTransformer2DModel(nn.Module):
     ):
         """
         Args:
-            hidden_states ( When discrete, `torch.LongTensor` of shape `(batch size, num latent pixels)`.
-                When continuous, `torch.FloatTensor` of shape `(batch size, channel, height, width)`): Input
+            hidden_states ( When discrete, `paddle.Tensor` of shape `(batch size, num latent pixels)`.
+                When continuous, `paddle.Tensor` of shape `(batch size, channel, height, width)`): Input
                 hidden_states
-            encoder_hidden_states ( `torch.LongTensor` of shape `(batch size, encoder_hidden_states dim)`, *optional*):
+            encoder_hidden_states ( `paddle.Tensor` of shape `(batch size, encoder_hidden_states dim)`, *optional*):
                 Conditional embeddings for cross attention layer. If not given, cross-attention defaults to
                 self-attention.
-            timestep ( `torch.long`, *optional*):
+            timestep ( `paddle.Tensor`, *optional*):
                 Optional timestep to be applied as an embedding in AdaLayerNorm's. Used to indicate denoising step.
-            attention_mask (`torch.FloatTensor`, *optional*):
+            attention_mask (`paddle.Tensor`, *optional*):
                 Optional attention mask to be applied in CrossAttention
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`models.unet_2d_condition.UNet2DConditionOutput`] instead of a plain tuple.

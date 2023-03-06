@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ..utils import is_flax_available, is_torch_available
+from ..utils.import_utils import is_paddle_available
 
-
-if is_torch_available():
+if is_paddle_available():
     from .autoencoder_kl import AutoencoderKL
     from .dual_transformer_2d import DualTransformer2DModel
+    from .ema import LitEma
     from .modeling_utils import ModelMixin
     from .prior_transformer import PriorTransformer
     from .transformer_2d import Transformer2DModel
@@ -25,7 +25,3 @@ if is_torch_available():
     from .unet_2d import UNet2DModel
     from .unet_2d_condition import UNet2DConditionModel
     from .vq_model import VQModel
-
-if is_flax_available():
-    from .unet_2d_condition_flax import FlaxUNet2DConditionModel
-    from .vae_flax import FlaxAutoencoderKL

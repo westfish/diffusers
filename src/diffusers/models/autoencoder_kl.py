@@ -14,8 +14,8 @@
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
-import torch
-import torch.nn as nn
+import paddle
+import paddle.nn as nn
 
 from ..configuration_utils import ConfigMixin, register_to_config
 from ..utils import BaseOutput, apply_forward_hook
@@ -34,7 +34,7 @@ class AutoencoderKLOutput(BaseOutput):
             `DiagonalGaussianDistribution` allows for sampling latents from the distribution.
     """
 
-    latent_dist: "DiagonalGaussianDistribution"
+    latent_dist: DiagonalGaussianDistribution
 
 
 class AutoencoderKL(ModelMixin, ConfigMixin):
@@ -105,12 +105,12 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
             act_fn=act_fn,
         )
 
-        self.quant_conv = nn.Conv2d(2 * latent_channels, 2 * latent_channels, 1)
-        self.post_quant_conv = nn.Conv2d(latent_channels, latent_channels, 1)
+        self.quant_conv = nn.Conv2D(2 * latent_channels, 2 * latent_channels, 1)
+        self.post_quant_conv = nn.Conv2D(latent_channels, latent_channels, 1)
         self.use_slicing = False
 
     @apply_forward_hook
-    def encode(self, x: torch.FloatTensor, return_dict: bool = True) -> AutoencoderKLOutput:
+    def encode(self, x: paddle.Tensor, return_dict: bool = True) -> AutoencoderKLOutput:
         h = self.encoder(x)
         moments = self.quant_conv(h)
         posterior = DiagonalGaussianDistribution(moments)
@@ -120,7 +120,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
 
         return AutoencoderKLOutput(latent_dist=posterior)
 
-    def _decode(self, z: torch.FloatTensor, return_dict: bool = True) -> Union[DecoderOutput, torch.FloatTensor]:
+    def _decode(self, z: paddle.Tensor, return_dict: bool = True) -> Union[DecoderOutput, paddle.Tensor]:
         z = self.post_quant_conv(z)
         dec = self.decoder(z)
 
@@ -146,10 +146,13 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
         self.use_slicing = False
 
     @apply_forward_hook
-    def decode(self, z: torch.FloatTensor, return_dict: bool = True) -> Union[DecoderOutput, torch.FloatTensor]:
+    def decode(self, z: paddle.Tensor, return_dict: bool = True) -> Union[DecoderOutput, paddle.Tensor]:
+        # TODO junnyu, add this to support pure fp16
+        z = z.cast(self.dtype)
         if self.use_slicing and z.shape[0] > 1:
+            # split、chunk paddle vs pytorch may have some difference
             decoded_slices = [self._decode(z_slice).sample for z_slice in z.split(1)]
-            decoded = torch.cat(decoded_slices)
+            decoded = paddle.concat(decoded_slices)
         else:
             decoded = self._decode(z).sample
 
@@ -160,14 +163,14 @@ class AutoencoderKL(ModelMixin, ConfigMixin):
 
     def forward(
         self,
-        sample: torch.FloatTensor,
+        sample: paddle.Tensor,
         sample_posterior: bool = False,
         return_dict: bool = True,
-        generator: Optional[torch.Generator] = None,
-    ) -> Union[DecoderOutput, torch.FloatTensor]:
+        generator: Optional[paddle.Generator] = None,
+    ) -> Union[DecoderOutput, paddle.Tensor]:
         r"""
         Args:
-            sample (`torch.FloatTensor`): Input sample.
+            sample (`paddle.Tensor`): Input sample.
             sample_posterior (`bool`, *optional*, defaults to `False`):
                 Whether to sample from the posterior.
             return_dict (`bool`, *optional*, defaults to `True`):
